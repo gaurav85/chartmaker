@@ -1,0 +1,132 @@
+name: Process Aviation Charts
+
+on:
+  # Run every 56 days (FAA chart cycle)
+  schedule:
+    - cron: '0 2 1 */2 *'  # 2 AM UTC, every 2 months on the 1st
+  
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      chart_type:
+        description: 'Chart type to process'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - sectional
+          - terminal
+          - enroute_low
+          - enroute_high
+
+jobs:
+  process-charts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480  # 8 hours max
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          df -h
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build chartmaker Docker image
+        run: |
+          docker build -t chartmaker:latest .
+      
+      - name: Install B2 CLI
+        run: |
+          wget https://github.com/Backblaze/B2_Command_Line_Tool/releases/latest/download/b2-linux
+          chmod +x b2-linux
+          sudo mv b2-linux /usr/local/bin/b2
+      
+      - name: Configure B2 credentials
+        run: |
+          b2 authorize-account ${{ secrets.B2_KEY_ID }} ${{ secrets.B2_APPLICATION_KEY }}
+      
+      - name: Process charts
+        run: |
+          # Determine which charts to process
+          CHART_TYPE="${{ github.event.inputs.chart_type }}"
+          if [ -z "$CHART_TYPE" ] || [ "$CHART_TYPE" = "all" ]; then
+            COMMAND="node make.js"
+          else
+            COMMAND="node make.js --chart-type=$CHART_TYPE"
+          fi
+          
+          # Run chartmaker in Docker
+          docker run --rm \
+            -v $(pwd)/public/charts:/chartmaker/public/charts \
+            -v $(pwd)/workarea:/chartmaker/workarea \
+            -v $(pwd)/chartcache:/chartmaker/chartcache \
+            chartmaker:latest \
+            bash -c "cd /chartmaker && $COMMAND"
+      
+      - name: Upload to Backblaze B2
+        run: |
+          CHART_DATE=$(date +%m-%d-%Y)
+          
+          # Sync charts to B2
+          b2 sync --replaceNewer \
+            public/charts/$CHART_DATE/ \
+            b2://${{ secrets.B2_BUCKET_NAME }}/$CHART_DATE/
+          
+          # Update latest symlink
+          echo $CHART_DATE > latest.txt
+          b2 upload-file ${{ secrets.B2_BUCKET_NAME }} latest.txt latest.txt
+      
+      - name: Purge Cloudflare cache
+        run: |
+          curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"purge_everything":true}'
+      
+      - name: Create processing report
+        if: always()
+        run: |
+          echo "# Chart Processing Report" > report.md
+          echo "Date: $(date)" >> report.md
+          echo "Chart Type: ${{ github.event.inputs.chart_type }}" >> report.md
+          echo "" >> report.md
+          echo "## Disk Usage" >> report.md
+          df -h >> report.md
+          echo "" >> report.md
+          echo "## Charts Processed" >> report.md
+          ls -lh public/charts/ >> report.md
+      
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: processing-report
+          path: report.md
+          retention-days: 30
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf workarea/* chartcache/*
+          docker system prune -af
+
+  notify:
+    needs: process-charts
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send notification
+        run: |
+          if [ "${{ needs.process-charts.result }}" == "success" ]; then
+            echo "✅ Charts processed successfully"
+          else
+            echo "❌ Chart processing failed"
+          fi

@@ -1,4 +1,3 @@
-
 **/.vscode
 **/node_modules
 **/workarea*
@@ -9,3 +8,24 @@
 **/appimages
 /debug.log
 
+# Working directories
+workarea/
+chartcache/
+public/charts/
+node_modules/
+
+# Logs
+*.log
+debug.log
+
+# Environment files
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
