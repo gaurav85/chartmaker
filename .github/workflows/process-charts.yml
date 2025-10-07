@@ -11,19 +11,19 @@ on:
       chart_type:
         description: 'Chart type to process'
         required: false
-        default: 'all'
+        default: 'single_sectional'
         type: choice
         options:
-          - all
-          - sectional
-          - terminal
-          - enroute_low
-          - enroute_high
+          - single_sectional     # Test with one chart (~1 hour)
+          - all_sectionals       # All 53 sectional charts (~6 hours)
+          - single_full          # One full chart type
+          - all_full             # All full charts (~8 hours)
+          - everything           # Everything (~12 hours)
 
 jobs:
   process-charts:
     runs-on: ubuntu-latest
-    timeout-minutes: 480  # 8 hours max
+    timeout-minutes: 720  # 12 hours max
     
     steps:
       - name: Checkout repository
@@ -34,6 +34,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
           df -h
       
       - name: Set up Docker Buildx
@@ -43,72 +45,176 @@ jobs:
         run: |
           docker build -t chartmaker:latest .
       
-      - name: Install B2 CLI
+      - name: Install B2 CLI (v4.x)
         run: |
-          wget https://github.com/Backblaze/B2_Command_Line_Tool/releases/latest/download/b2-linux
-          chmod +x b2-linux
-          sudo mv b2-linux /usr/local/bin/b2
+          pip install b2[full]
       
       - name: Configure B2 credentials
         run: |
-          b2 authorize-account ${{ secrets.B2_KEY_ID }} ${{ secrets.B2_APPLICATION_KEY }}
+          b2 account authorize ${{ secrets.B2_KEY_ID }} ${{ secrets.B2_APPLICATION_KEY }}
       
-      - name: Process charts
+      - name: Determine chart processing command
+        id: chart_command
         run: |
-          # Determine which charts to process
           CHART_TYPE="${{ github.event.inputs.chart_type }}"
-          if [ -z "$CHART_TYPE" ] || [ "$CHART_TYPE" = "all" ]; then
-            COMMAND="node make.js"
-          else
-            COMMAND="node make.js --chart-type=$CHART_TYPE"
+          
+          # Default to single sectional if not specified
+          if [ -z "$CHART_TYPE" ]; then
+            CHART_TYPE="single_sectional"
           fi
+          
+          case "$CHART_TYPE" in
+            "single_sectional")
+              # Process Dallas-Ft Worth sectional (index 12)
+              COMMAND="area-single=12"
+              ;;
+            "all_sectionals")
+              COMMAND="area-all"
+              ;;
+            "single_full")
+              # Process Sectional full chart (index 0)
+              COMMAND="full-single=0"
+              ;;
+            "all_full")
+              COMMAND="full-all"
+              ;;
+            "everything")
+              COMMAND="area-all"
+              COMMAND2="full-all"
+              ;;
+            *)
+              COMMAND="area-single=12"
+              ;;
+          esac
+          
+          echo "command=$COMMAND" >> $GITHUB_OUTPUT
+          echo "command2=$COMMAND2" >> $GITHUB_OUTPUT
+          echo "Processing with command: $COMMAND"
+      
+      - name: Process charts (Part 1)
+        run: |
+          COMMAND="${{ steps.chart_command.outputs.command }}"
+          
+          echo "Starting chart processing: $COMMAND"
           
           # Run chartmaker in Docker
           docker run --rm \
-            -v $(pwd)/public/charts:/chartmaker/public/charts \
+            -v $(pwd)/public:/chartmaker/public \
             -v $(pwd)/workarea:/chartmaker/workarea \
             -v $(pwd)/chartcache:/chartmaker/chartcache \
             chartmaker:latest \
-            bash -c "cd /chartmaker && $COMMAND"
+            bash -c "cd /chartmaker && node make.js $COMMAND"
+          
+          echo "Chart processing completed"
+          ls -lh public/charts/
+      
+      - name: Process charts (Part 2 - if everything)
+        if: github.event.inputs.chart_type == 'everything'
+        run: |
+          COMMAND2="${{ steps.chart_command.outputs.command2 }}"
+          
+          if [ ! -z "$COMMAND2" ]; then
+            echo "Starting second batch: $COMMAND2"
+            
+            docker run --rm \
+              -v $(pwd)/public:/chartmaker/public \
+              -v $(pwd)/workarea:/chartmaker/workarea \
+              -v $(pwd)/chartcache:/chartmaker/chartcache \
+              chartmaker:latest \
+              bash -c "cd /chartmaker && node make.js $COMMAND2"
+          fi
+      
+      - name: Get chart date
+        id: chart_date
+        run: |
+          # Get the chart date from chartdates.json
+          CHART_DATE=$(node -e "
+            const fs = require('fs');
+            const dates = JSON.parse(fs.readFileSync('chartdates.json', 'utf8'));
+            const now = new Date();
+            const today = now.getTime();
+            
+            for (let date of dates.ChartDates) {
+              const chartDate = new Date(date);
+              const diffDays = (today - chartDate.getTime()) / (1000 * 60 * 60 * 24);
+              
+              if (diffDays >= -20 && diffDays <= 36) {
+                console.log(date);
+                break;
+              }
+            }
+          ")
+          
+          echo "chart_date=$CHART_DATE" >> $GITHUB_OUTPUT
+          echo "Processing chart date: $CHART_DATE"
       
       - name: Upload to Backblaze B2
+        env:
+          CHART_DATE: ${{ steps.chart_date.outputs.chart_date }}
         run: |
-          CHART_DATE=$(date +%m-%d-%Y)
+          # Check if charts were generated
+          if [ ! -d "public/charts/$CHART_DATE" ]; then
+            echo "No charts found in public/charts/$CHART_DATE"
+            echo "Checking what was generated..."
+            find public/charts -type f -name "*.db" | head -20
+            exit 1
+          fi
           
-          # Sync charts to B2
-          b2 sync --replaceNewer \
+          echo "Uploading charts from: public/charts/$CHART_DATE"
+          
+          # Sync charts to B2 (using newer B2 CLI v4 syntax)
+          b2 sync \
+            --keep-days 90 \
+            --replace-newer \
             public/charts/$CHART_DATE/ \
             b2://${{ secrets.B2_BUCKET_NAME }}/$CHART_DATE/
           
-          # Update latest symlink
+          echo "Upload completed"
+          
+          # Update latest.txt with current chart date
           echo $CHART_DATE > latest.txt
-          b2 upload-file ${{ secrets.B2_BUCKET_NAME }} latest.txt latest.txt
+          b2 file upload \
+            --no-progress \
+            ${{ secrets.B2_BUCKET_NAME }} \
+            latest.txt \
+            latest.txt
+          
+          echo "Chart date marker updated: $CHART_DATE"
       
       - name: Purge Cloudflare cache
         run: |
           curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
             -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json" \
-            --data '{"purge_everything":true}'
+            --data '{"purge_everything":true}' \
+            -w "\nHTTP Status: %{http_code}\n"
       
       - name: Create processing report
         if: always()
+        env:
+          CHART_DATE: ${{ steps.chart_date.outputs.chart_date }}
         run: |
           echo "# Chart Processing Report" > report.md
-          echo "Date: $(date)" >> report.md
-          echo "Chart Type: ${{ github.event.inputs.chart_type }}" >> report.md
+          echo "" >> report.md
+          echo "**Date:** $(date)" >> report.md
+          echo "**Chart Date:** $CHART_DATE" >> report.md
+          echo "**Chart Type:** ${{ github.event.inputs.chart_type }}" >> report.md
+          echo "" >> report.md
+          echo "## Processing Summary" >> report.md
+          echo "\`\`\`" >> report.md
+          find public/charts -name "*.db" -exec ls -lh {} \; >> report.md
+          echo "\`\`\`" >> report.md
           echo "" >> report.md
           echo "## Disk Usage" >> report.md
+          echo "\`\`\`" >> report.md
           df -h >> report.md
-          echo "" >> report.md
-          echo "## Charts Processed" >> report.md
-          ls -lh public/charts/ >> report.md
+          echo "\`\`\`" >> report.md
       
       - name: Upload report as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: processing-report
+          name: processing-report-${{ steps.chart_date.outputs.chart_date }}
           path: report.md
           retention-days: 30
       
@@ -126,7 +232,9 @@ jobs:
       - name: Send notification
         run: |
           if [ "${{ needs.process-charts.result }}" == "success" ]; then
-            echo "✅ Charts processed successfully"
+            echo "✅ Charts processed and uploaded successfully"
+            echo "Access at: https://charts.leonis85.com/"
           else
             echo "❌ Chart processing failed"
+            echo "Check logs at: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           fi
