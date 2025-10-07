@@ -44,8 +44,8 @@ COPY . .
 # Install npm dependencies
 RUN npm install
 
-# Install Python dependencies for mbutil
-RUN pip3 install --break-system-packages pillow requests
+# Install Python dependencies for mbutil (FIXED LINE)
+RUN pip3 install pillow requests
 
 # Create necessary directories
 RUN mkdir -p workarea chartcache public/charts
