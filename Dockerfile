@@ -44,14 +44,16 @@ COPY . .
 # Install npm dependencies
 RUN npm install
 
-# Install Python dependencies for mbutil (FIXED LINE)
+# Install Python dependencies for mbutil
 RUN pip3 install pillow requests
 
 # Create necessary directories
 RUN mkdir -p workarea chartcache public/charts
 
-# Set permissions
-RUN chmod +x mergetiles.pl mb-util
+# Set permissions for executables
+RUN chmod +x mergetiles.pl && \
+    chmod +x mbutil/mb-util && \
+    ln -s /chartmaker/mbutil/mb-util /usr/local/bin/mb-util
 
 # Default command
 CMD ["node", "make.js"]
