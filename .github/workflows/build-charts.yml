@@ -7,39 +7,29 @@ on:
         description: 'Chartmaker args (e.g., area-single=12, full-single=0, area-all)'
         required: true
         default: 'area-single=12'
-      bucket_prefix:
-        description: 'Prefix inside the B2 bucket (e.g., charts/prod)'
+      chart_type:
+        description: 'Friendly chart type label for the report (e.g., sectional, full)'
         required: true
-        default: 'charts/prod'
+        default: 'sectional'
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  build:
+  process-charts:
     runs-on: ubuntu-latest
 
-    # Use the prebuilt chartmaker image so Node, GDAL, etc. are ready.
+    # Use the published image; we’ll add Node+jq inside the job.
     container:
       image: n129bz/chartmaker:latest
-      options: >-
-        --entrypoint /bin/bash
 
     env:
-      # Backblaze B2 S3 credentials (from your repo secrets)
-      AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}     # e.g., https://s3.us-west-004.backblazeb2.com
-      B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
-      # Cloudflare (optional)
-      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-      # Workflow inputs
-      CHART_ARGS: ${{ github.event.inputs.chart_args }}
-      BUCKET_PREFIX: ${{ github.event.inputs.bucket_prefix }}
-      # Verbose command logging from chartmaker? (true/false)
-      MAKE_VERBOSE: "false"
+      # Prevent chartmaker from starting the web server
+      WEBSERVERMODE: "false"
+
+      # B2 bucket (so we can refer to it in multiple steps)
+      B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
 
     steps:
       - name: Check out repo
@@ -48,119 +38,174 @@ jobs:
       - name: Install Node & jq inside container
         run: |
           set -euxo pipefail
-          if command -v node >/dev/null 2>&1; then
-            node -v
-            exit 0
+          if command -v node >/dev/null 2>&1; then node -v; else
+            if command -v apt-get >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y curl ca-certificates gnupg jq
+              mkdir -p /etc/apt/keyrings
+              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+                | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+              echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" \
+                > /etc/apt/sources.list.d/nodesource.list
+              apt-get update
+              apt-get install -y nodejs
+            elif command -v apk >/dev/null 2>&1; then
+              apk add --no-cache nodejs-current npm jq
+            elif command -v yum >/dev/null 2>&1; then
+              yum install -y jq
+              curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
+              yum install -y nodejs
+            else
+              echo "Unsupported base image: could not install Node." >&2
+              exit 1
+            fi
           fi
-
-          if command -v apt-get >/dev/null 2>&1; then
-            apt-get update
-            apt-get install -y curl ca-certificates gnupg jq
-            mkdir -p /etc/apt/keyrings
-            curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-              | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-            echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" \
-              > /etc/apt/sources.list.d/nodesource.list
-            apt-get update
-            apt-get install -y nodejs
-          elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache nodejs-current npm jq
-          elif command -v yum >/dev/null 2>&1; then
-            yum install -y jq
-            curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
-            yum install -y nodejs
-          else
-            echo "Unsupported base image: could not install Node." >&2
-            exit 1
-          fi
-
           node -v
 
-      - name: Show environment (debug)
-        run: |
-          set -euxo pipefail
-          node -v
-          gdalinfo --version || true
-          echo "CHART_ARGS: $CHART_ARGS"
-          echo "B2_BUCKET: $B2_BUCKET"
-          echo "BUCKET_PREFIX: $BUCKET_PREFIX"
-          echo "B2_ENDPOINT: $B2_ENDPOINT"
-
-      # --- TEMP PATCH: guard an undefined 'dbf' in make.js (prevents your TypeError) ---
-      - name: Patch chartmaker for dbf null-guard
+      - name: Patch chartmaker (defensive null-guard)
         working-directory: /chartmaker
         run: |
           set -euxo pipefail
-          # Only patch if the line exists and hasn't been patched already
           if grep -n 'dbf.length' make.js >/dev/null 2>&1; then
             sed -i 's/(dbf.length > 0 && fs.existsSync(dbf))/(dbf && dbf.length > 0 && fs.existsSync(dbf))/' make.js
           fi
-      
-      - name: Disable webserver in settings.json (inside container)
-        working-directory: /chartmaker
-        run: |
-          set -euxo pipefail
-          apt-get update && apt-get install -y jq
-          jq '.settings.webservermode=false | .settings.opendefaultbrowser=false' settings.json > tmp && mv tmp settings.json
 
-      # Run chartmaker inside the image
-      - name: Run chartmaker to build selected charts (container)
+      - name: Build charts (no webserver)
         working-directory: /chartmaker
         env:
-          # Let chartmaker write DBs into its default folder (/chartmaker/public/charts)
-          # You can change the default in settings.json if you want a different path.
-          MAKE_VERBOSE: ${{ env.MAKE_VERBOSE }}
+          WEBSERVERMODE: "false"
         run: |
           set -euxo pipefail
+          node make "${{ github.event.inputs.chart_args }}"
 
-          # (Optional) show chosen settings for reproducibility
-          node make -s || true
+      - name: Find charts output (path + date)
+        id: chart_meta
+        run: |
+          set -euo pipefail
+          ROOT=""
+          if [ -d "/chartmaker/charts" ]; then
+            ROOT="/chartmaker/charts"
+          elif [ -d "/chartmaker/public/charts" ]; then
+            ROOT="/chartmaker/public/charts"
+          else
+            echo "No charts directory found" >&2; exit 1
+          fi
+          # choose newest subdir if present; otherwise use root
+          if find "$ROOT" -mindepth 1 -maxdepth 1 -type d | grep -q . ; then
+            CHART_DIR="$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | sort | tail -n1)"
+          else
+            CHART_DIR="$ROOT"
+          fi
+          CHART_DATE="$(date -u +%Y-%m-%d)"
+          echo "chart_dir=$CHART_DIR"   >> "$GITHUB_OUTPUT"
+          echo "chart_date=$CHART_DATE" >> "$GITHUB_OUTPUT"
+          echo "Using CHART_DIR=$CHART_DIR  CHART_DATE=$CHART_DATE"
+          echo "Preview:"
+          find "$CHART_DIR" -maxdepth 1 -type f -name '*.db' -printf '%f\n' | head -20 || true
 
-          # Build the selected chart(s) using command-line args
-          # Examples:
-          #   area-single=12     -> a single sectional area by index (0..52)
-          #   area-all           -> all sectional areas
-          #   full-single=0      -> "Sectional" full bundle
-          #   full-single=7      -> "US_VFR_Wall_Planning"
-          node make "$CHART_ARGS"
-
-      - name: List generated databases (debug)
+      - name: Install B2 CLI (v4.x)
         run: |
           set -euxo pipefail
-          find /chartmaker/public/charts -maxdepth 1 -type f -name '*.db' -printf "%f\n" || true
+          if ! command -v pip3 >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y python3-pip
+          fi
+          pip3 install --upgrade "b2[full]"
 
-      - name: Install AWS CLI for B2 S3 uploads
-        run: |
-          set -euxo pipefail
-          apt-get update
-          apt-get install -y curl unzip groff less
-          curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip -q awscliv2.zip
-          ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli || true
-          aws --version
-
-      - name: Upload to Backblaze B2 (S3 API)
+      - name: Configure B2 credentials
         env:
-          AWS_DEFAULT_REGION: us-west-004
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APPLICATION_KEY }}
         run: |
           set -euxo pipefail
-          SRC_DIR="/chartmaker/public/charts"
-          # Create a manifest and upload every .db produced
-          shopt -s nullglob
-          for f in "$SRC_DIR"/*.db; do
-            base="$(basename "$f")"
-            dest="s3://${B2_BUCKET}/${BUCKET_PREFIX}/${base}"
-            echo "Uploading $f -> $dest"
-            aws s3 cp "$f" "$dest" --endpoint-url "${B2_ENDPOINT}" --only-show-errors
-          done
+          b2 account authorize "${B2_KEY_ID}" "${B2_APP_KEY}"
 
-      - name: (Optional) Purge Cloudflare cache
-        if: ${{ env.CF_API_TOKEN && env.CF_ZONE_ID }}
+      - name: Upload to Backblaze B2 (sync + latest.txt)
+        env:
+          CHART_DIR:  ${{ steps.chart_meta.outputs.chart_dir }}
+          CHART_DATE: ${{ steps.chart_meta.outputs.chart_date }}
+          B2_BUCKET:  ${{ env.B2_BUCKET_NAME }}
         run: |
           set -euxo pipefail
-          # Purge whole zone cache so the CDN serves fresh db URLs
-          curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data '{"purge_everything":true}' \
-            | tee /dev/stderr
+          test -d "${CHART_DIR}"
+          echo "Uploading ${CHART_DIR} -> b2://${B2_BUCKET}/${CHART_DATE}/"
+          b2 sync --keep-days 90 --replace-newer \
+            "${CHART_DIR}/" "b2://${B2_BUCKET}/${CHART_DATE}/"
+
+          echo "${CHART_DATE}" > latest.txt
+          b2 file upload --no-progress "${B2_BUCKET}" latest.txt latest.txt
+          echo "Upload complete and latest.txt updated"
+
+      - name: Purge Cloudflare cache
+        env:
+          CF_ZONE_ID:   ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          CF_API_EMAIL: ${{ secrets.CLOUDFLARE_API_EMAIL }}
+          CF_API_KEY:   ${{ secrets.CLOUDFLARE_API_KEY }}
+        run: |
+          set -euxo pipefail
+          curl -sS "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+            -H 'Content-Type: application/json' \
+            -H "X-Auth-Email: ${CF_API_EMAIL}" \
+            -H "X-Auth-Key: ${CF_API_KEY}" \
+            -d '{"purge_everything":true}' \
+            -w "\nHTTP Status: %{http_code}\n"
+
+      # -------- your extra steps --------
+
+      - name: Create processing report
+        if: always()
+        env:
+          CHART_DATE:  ${{ steps.chart_meta.outputs.chart_date }}
+          CHART_DIR:   ${{ steps.chart_meta.outputs.chart_dir }}
+          CHART_TYPE:  ${{ github.event.inputs.chart_type }}
+        run: |
+          set -euo pipefail
+          REPORT="$GITHUB_WORKSPACE/report.md"
+          {
+            echo "# Chart Processing Report"
+            echo
+            echo "**Date:** $(date -u)  "
+            echo "**Chart Date:** ${CHART_DATE}  "
+            echo "**Chart Type:** ${CHART_TYPE}  "
+            echo
+            echo "## Processing Summary"
+            echo '```'
+            find "${CHART_DIR}" -maxdepth 1 -type f -name "*.db" -exec ls -lh {} \;
+            echo '```'
+            echo
+            echo "## Disk Usage"
+            echo '```'
+            df -h
+            echo '```'
+          } > "$REPORT"
+          echo "Wrote $REPORT"
+
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: processing-report-${{ steps.chart_meta.outputs.chart_date }}
+          path: report.md
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          set +e
+          rm -rf /chartmaker/workarea/* /chartmaker/chartcache/* 2>/dev/null || true
+          echo "Cleanup completed"
+
+  notify:
+    needs: process-charts
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send notification
+        run: |
+          if [ "${{ needs.process-charts.result }}" = "success" ]; then
+            echo "✅ Charts processed and uploaded successfully"
+            echo "Access at: https://charts.leonis85.com/"
+          else
+            echo "❌ Chart processing failed"
+            echo "Check logs at: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
