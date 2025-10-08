@@ -95,21 +95,58 @@ jobs:
         working-directory: /chartmaker
         run: |
           set -euo pipefail
-          TODAY="$(date -u +%Y-%m-%d)"
-          TARGET="$(
-            jq -r --arg today "$TODAY" '
-              [ .[] | {d: ., t: (strptime("%Y-%m-%d") | mktime)} ] 
-              | sort_by(.t)
-              | ( [ .[] | select(.t <= (strptime($today)|mktime)) ] | last // empty ),
-                ( [ .[] | select(.t >  (strptime($today)|mktime)) ] | first // empty )
-              | select(.) | .d
-            ' chartdates.json | head -n1
-          )"
-          if [ -z "$TARGET" ]; then
-            echo "No dates found in chartdates.json" >&2; exit 1
+
+          # 1) Extract all ISO dates from anywhere in the JSON (string values or .date/.Date fields)
+          mapfile -t DATES < <(
+            jq -r '
+              # collect values explicitly named .date/.Date, plus any string values
+              (.. | .date? // .Date? // empty),
+              (.. | select(type == "string"))
+              # keep only proper YYYY-MM-DD strings
+              | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))
+            ' chartdates.json \
+            | sort -u
+          )
+
+          if [ "${#DATES[@]}" -eq 0 ]; then
+            echo "No ISO dates found in chartdates.json" >&2
+            exit 1
           fi
+
+          # 2) Pick latest <= today, else earliest > today
+          TODAY_EPOCH="$(date -u +%s)"
+          PREV=""
+          NEXT=""
+
+          for d in "${DATES[@]}"; do
+            # skip invalid calendars just in case
+            if ! EPOCH="$(date -u -d "$d" +%s 2>/dev/null)"; then
+              continue
+            fi
+            if [ "$EPOCH" -le "$TODAY_EPOCH" ]; then
+              PREV="$d"
+            else
+              if [ -z "${NEXT:-}" ]; then
+                NEXT="$d"
+              fi
+              # we keep scanning to finalize PREV, but don't overwrite NEXT once set
+            fi
+          done
+
+          if [ -n "$PREV" ]; then
+            TARGET="$PREV"
+          else
+            TARGET="$NEXT"
+          fi
+
+          if [ -z "${TARGET:-}" ]; then
+            echo "Could not determine target date from: ${DATES[*]}" >&2
+            exit 1
+          fi
+
           echo "target_date=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "Selected FAA chart date: $TARGET (today=$TODAY)"
+          echo "Selected FAA chart date: $TARGET (today=$(date -u +%Y-%m-%d))"
+
 
       # ----- Skip build if B2 already has tiles for that date/type -----
       - name: Check B2 for existing tiles (skip if present)
