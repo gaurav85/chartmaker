@@ -1,16 +1,21 @@
-FROM ubuntu:24.04
+FROM ubuntu:22.04
 
+# Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=America/Chicago
 
-# Install Node.js 20 LTS
-RUN apt-get update && apt-get install -y ca-certificates curl gnupg \
+# Install Node.js 20 LTS from NodeSource
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    gnupg \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update
 
-# Install all dependencies (Ubuntu 24.04 has GDAL 3.8.4 by default)
-RUN apt-get update && apt-get install -y \
+# Install all dependencies including Node.js 20
+RUN apt-get install -y \
     nodejs \
     sqlite3 \
     python3 \
@@ -19,40 +24,52 @@ RUN apt-get update && apt-get install -y \
     cpanminus \
     pngquant \
     imagemagick \
-    curl \
     unzip \
     build-essential \
-    gdal-bin \
     libgdal-dev \
-    python3-gdal \
+    libssl-dev \
+    gdal-bin=3.11* \
     && rm -rf /var/lib/apt/lists/*
 
-# Verify versions
-RUN node --version && gdalinfo --version
+# Verify Node.js version
+RUN node --version && npm --version
 
 # Install Perl dependencies
-RUN cpanm --notest strict warnings autodie Carp Modern::Perl Params::Validate File::Slurp File::Copy
+# RUN cpanm --notest \
+#     strict \
+#     warnings \
+#     autodie \
+#     Carp \
+#     Modern::Perl \
+#     Params::Validate \
+#     File::Slurp \
+#     File::Copy
 
+# Set working directory
 WORKDIR /chartmaker
 
+# Copy package files first for better caching
 COPY package*.json ./
+
+# Install npm dependencies
 RUN npm install
 
+# Copy rest of chartmaker files
 COPY . .
 
-RUN pip3 install --break-system-packages pillow requests
+# Install Python dependencies for mbutil
+RUN pip3 install pillow requests
 
-# Create directories with proper permissions
-RUN mkdir -p workarea chartcache public/charts && \
-    chmod -R 777 workarea chartcache public
+# Create necessary directories
+RUN mkdir -p workarea chartcache public/charts
 
-RUN chmod +x mergetiles.pl mbutil/mb-util && \
+# Set permissions for executables
+RUN chmod +x mergetiles.pl && \
+    chmod +x mbutil/mb-util && \
     ln -s /chartmaker/mbutil/mb-util /usr/local/bin/mb-util
 
-# Run as non-root user
-RUN useradd -m -u 1001 chartmaker && \
-    chown -R chartmaker:chartmaker /chartmaker
+# Make script executable and run it
+RUN chmod +x ./perlinstall.sh && ./perlinstall.sh
 
-USER chartmaker
-
+# Default command
 CMD ["node", "make.js"]
