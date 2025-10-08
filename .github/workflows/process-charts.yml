@@ -50,11 +50,8 @@ jobs:
           b2 version
       
       - name: Configure B2
-        env:
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
         run: |
-          b2 account authorize $B2_KEY_ID $B2_APP_KEY
+          b2 account authorize ${{ secrets.B2_KEY_ID }} ${{ secrets.B2_APP_KEY }}
           echo "B2 authorization successful"
       
       - name: Determine chart command
