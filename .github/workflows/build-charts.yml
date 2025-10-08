@@ -158,34 +158,36 @@ jobs:
           fi
 
       # ---------- Patch IFR High shapefile pattern (l->h) ----------
-      - name: Fix IFR High clipshape filenames (provide l* aliases)
+      - name: Fix IFR High clipshape filenames (create l* aliases for all h*)
         if: matrix.chart_type.id == 'ifr_high'
         working-directory: /chartmaker/clipshapes/enroute_high
         run: |
           set -euxo pipefail
+          echo "Before aliasing:"
+          ls -1 || true
 
-          make_alias_set() {
-            base="$1"  # e.g., enr_h01  -> create enr_l01.*
-            src="${base}"
-            dst="${base/enr_h/enr_l}"
-            # For each SHP sidecar extension, copy if the l* file is missing
+          shopt -s nullglob
+          made_any=0
+          for shp in enr_h*.shp; do
+            base="${shp%.shp}"         # e.g., enr_h36
+            num="${base#enr_h}"        # e.g., 36
+            dst="enr_l${num}"          # e.g., enr_l36
             for ext in shp shx dbf prj; do
-              if [ -f "${src}.${ext}" ] && [ ! -e "${dst}.${ext}" ]; then
-                # copy instead of symlink to avoid any GDAL/container sym-linking surprises
-                cp -f "${src}.${ext}" "${dst}.${ext}"
+              if [ -f "${base}.${ext}" ] && [ ! -e "${dst}.${ext}" ]; then
+                cp -f "${base}.${ext}" "${dst}.${ext}"
+                made_any=1
               fi
             done
-          }
-
-          # Create aliases for 01..12 (adjust range if your set differs)
-          for n in $(seq -w 01 12); do
-            if [ -f "enr_h${n}.shp" ]; then
-              make_alias_set "enr_h${n}"
-            fi
           done
 
-          echo "After aliasing, directory contains:"
-          ls -1
+          echo "After aliasing:"
+          ls -1 || true
+
+          if [ "$made_any" -eq 0 ]; then
+            echo "No 'enr_h*.shp' files found to alias; directory contents:" >&2
+            ls -la >&2 || true
+            # don't exit hard—let the build try; but warn loudly
+          fi
 
       # ---------- Build if needed ----------
       - name: Build charts for ${{ matrix.chart_type.id }}
@@ -236,9 +238,9 @@ jobs:
 
           while IFS= read -r ROOT; do
             echo "Syncing $ROOT -> $DEST"
-            # Portable flags: --noProgress and --threads are widely available
+            # Portable flags: --no-progress and --threads are widely available
             b2 sync \
-              --noProgress \
+              --no-progress \
               --threads 16 \
               "$ROOT/" "$DEST"
           done < "$TILE_ROOTS_FILE"
