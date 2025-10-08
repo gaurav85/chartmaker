@@ -222,8 +222,11 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          rm -rf workarea/* chartcache/*
+          # Use sudo to remove Docker-created files
+          sudo rm -rf workarea/* chartcache/*
           docker system prune -af
+          
+          echo "Cleanup completed"
 
   notify:
     needs: process-charts

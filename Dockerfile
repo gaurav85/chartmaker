@@ -1,22 +1,23 @@
-FROM ubuntu:22.04
+FROM node:20-bullseye
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=America/Chicago
 
-# Install Node.js 20 LTS from NodeSource
+# Add UbuntuGIS PPA for latest GDAL
 RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    curl \
+    software-properties-common \
     gnupg \
-    && mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
-    && apt-get update
+    wget \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install all dependencies including Node.js 20
-RUN apt-get install -y \
-    nodejs \
+# Install GDAL 3.8+ from UbuntuGIS
+RUN echo "deb http://ppa.launchpadcontent.net/ubuntugis/ubuntugis-unstable/ubuntu jammy main" > /etc/apt/sources.list.d/ubuntugis.list \
+    && apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 6B827C12C2D425E227EDCA75089EBE08314DF160 \
+    || wget -qO- https://qgis.org/downloads/qgis-2021.gpg.key | apt-key add -
+
+# Install all dependencies with updated GDAL
+RUN apt-get update && apt-get install -y \
     sqlite3 \
     python3 \
     python3-pip \
@@ -24,15 +25,17 @@ RUN apt-get install -y \
     cpanminus \
     pngquant \
     imagemagick \
+    curl \
     unzip \
     build-essential \
+    gdal-bin=3.8* \
     libgdal-dev \
-    libssl-dev \
-    gdal-bin \
+    python3-gdal \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Verify Node.js version
-RUN node --version && npm --version
+# Verify GDAL version (should be 3.8+)
+RUN gdalinfo --version
 
 # Install Perl dependencies
 RUN cpanm --notest \
@@ -60,13 +63,20 @@ COPY . .
 # Install Python dependencies for mbutil
 RUN pip3 install pillow requests
 
-# Create necessary directories
-RUN mkdir -p workarea chartcache public/charts
+# Create necessary directories with proper permissions
+RUN mkdir -p workarea chartcache public/charts && \
+    chmod -R 777 workarea chartcache public
 
 # Set permissions for executables
 RUN chmod +x mergetiles.pl && \
     chmod +x mbutil/mb-util && \
     ln -s /chartmaker/mbutil/mb-util /usr/local/bin/mb-util
+
+# Run as non-root user for better file permissions
+RUN useradd -m -u 1001 chartmaker && \
+    chown -R chartmaker:chartmaker /chartmaker
+
+USER chartmaker
 
 # Default command
 CMD ["node", "make.js"]
