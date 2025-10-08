@@ -42,28 +42,38 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Prepare output folders
+            - name: Prepare output & cache
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/_charts_out"
           mkdir -p "${GITHUB_WORKSPACE}/_charts_cache"
 
-      - name: Pull chartmaker image
-        run: docker pull n129bz/chartmaker:latest
-
-      - name: Install jq (host)
+      - name: Build “chartmaker-with-node” image (adds Node + jq)
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+          cat > Dockerfile.ci <<'EOF'
+          FROM n129bz/chartmaker:latest
+          # Install Node.js 18 LTS and jq
+          RUN apt-get update && \
+              apt-get install -y curl ca-certificates gnupg && \
+              mkdir -p /etc/apt/keyrings && \
+              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+              echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
+              apt-get update && \
+              apt-get install -y nodejs jq && \
+              node -v && npm -v && \
+              apt-get clean && rm -rf /var/lib/apt/lists/*
+          WORKDIR /chartmaker
+          EOF
+          docker build -t chartmaker-with-node -f Dockerfile.ci .
 
       - name: Force CI settings on host (no webserver; clean folders)
         run: |
           set -euo pipefail
-          # Edit the repo's settings.json (checked out on host):
+          # Edit the repo’s settings.json on the host
+          sudo apt-get update -y && sudo apt-get install -y jq
           jq '.settings.webservermode=false
               | .settings.cleanprocessfolders=true
               | .settings.opendefaultbrowser=false' settings.json > settings.json.tmp
           mv settings.json.tmp settings.json
-          echo "Effective settings:"
           jq '.settings | {webservermode, cleanprocessfolders, opendefaultbrowser, defaultdbfolder, dbextension}' settings.json
 
       - name: Run chartmaker to build selected charts (container)
@@ -74,9 +84,8 @@ jobs:
             -v "${GITHUB_WORKSPACE}/settings.json:/chartmaker/settings.json:ro" \
             -v "${GITHUB_WORKSPACE}/_charts_out:/chartmaker/externalcharts" \
             -v "${GITHUB_WORKSPACE}/_charts_cache:/chartmaker/chartcache" \
-            n129bz/chartmaker:latest \
+            chartmaker-with-node \
             node make "${CHART_ARGS}"
-            '
 
       - name: List generated databases (debug)
         run: |
