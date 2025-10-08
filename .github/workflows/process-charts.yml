@@ -118,19 +118,21 @@ jobs:
           if [ -z "$COMMAND" ]; then
             echo "No command specified, processing all charts"
             docker run --rm \
+              --entrypoint /bin/sh \
               -v $(pwd)/public:/chartmaker/public \
               -v $(pwd)/workarea:/chartmaker/workarea \
               -v $(pwd)/chartcache:/chartmaker/chartcache \
               n129bz/chartmaker:latest \
-              node make
+              -c "cd /chartmaker && node make"
           else
             echo "Processing with command: $COMMAND"
             docker run --rm \
+              --entrypoint /bin/sh \
               -v $(pwd)/public:/chartmaker/public \
               -v $(pwd)/workarea:/chartmaker/workarea \
               -v $(pwd)/chartcache:/chartmaker/chartcache \
               n129bz/chartmaker:latest \
-              node make $COMMAND
+              -c "cd /chartmaker && node make $COMMAND"
           fi
           
           echo "============================================"
