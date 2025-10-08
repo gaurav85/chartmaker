@@ -158,14 +158,34 @@ jobs:
           fi
 
       # ---------- Patch IFR High shapefile pattern (l->h) ----------
-      - name: Patch clip shape pattern for IFR High
+      - name: Fix IFR High clipshape filenames (provide l* aliases)
         if: matrix.chart_type.id == 'ifr_high'
-        working-directory: /chartmaker
+        working-directory: /chartmaker/clipshapes/enroute_high
         run: |
           set -euxo pipefail
-          # Replace any mistaken 'enr_lNN.shp' references in high flow with 'enr_hNN.shp'
-          grep -RIl 'enr_l..\.shp' . | xargs -r sed -i 's/enr_l\([0-9][0-9]\)\.shp/enr_h\1.shp/g'
-          ls -1 clipshapes/enroute_high || true
+
+          make_alias_set() {
+            base="$1"  # e.g., enr_h01  -> create enr_l01.*
+            src="${base}"
+            dst="${base/enr_h/enr_l}"
+            # For each SHP sidecar extension, copy if the l* file is missing
+            for ext in shp shx dbf prj; do
+              if [ -f "${src}.${ext}" ] && [ ! -e "${dst}.${ext}" ]; then
+                # copy instead of symlink to avoid any GDAL/container sym-linking surprises
+                cp -f "${src}.${ext}" "${dst}.${ext}"
+              fi
+            done
+          }
+
+          # Create aliases for 01..12 (adjust range if your set differs)
+          for n in $(seq -w 01 12); do
+            if [ -f "enr_h${n}.shp" ]; then
+              make_alias_set "enr_h${n}"
+            fi
+          done
+
+          echo "After aliasing, directory contains:"
+          ls -1
 
       # ---------- Build if needed ----------
       - name: Build charts for ${{ matrix.chart_type.id }}
