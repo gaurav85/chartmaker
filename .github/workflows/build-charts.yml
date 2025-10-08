@@ -12,6 +12,10 @@ on:
         required: true
         default: 'charts/prod'
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     runs-on: ubuntu-latest
