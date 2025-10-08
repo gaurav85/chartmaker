@@ -1,0 +1,109 @@
+name: Build & Publish FAA Charts
+
+on:
+  workflow_dispatch:
+    inputs:
+      chart_args:
+        description: "chartmaker CLI arg (e.g. full-all, full-single=3, area-single=33)"
+        required: true
+        default: "full-single=0"
+      bucket_prefix:
+        description: "Prefix/folder in the B2 bucket (e.g. charts/prod)"
+        required: true
+        default: "charts/prod"
+      make_verbose:
+        description: "Set to true to print chartmaker logs to console"
+        required: true
+        default: "false"
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440  # long runs are common when tiling
+
+    env:
+      # Backblaze S3-compatible creds
+      AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      AWS_DEFAULT_REGION: us-west-002
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
+
+      # Cloudflare (optional purge)
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CLOUDFlARE_ZONE_ID }}
+
+      # Job inputs
+      CHART_ARGS: ${{ github.event.inputs.chart_args }}
+      BUCKET_PREFIX: ${{ github.event.inputs.bucket_prefix }}
+      MAKE_VERBOSE: ${{ github.event.inputs.make_verbose }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Prepare output folders
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/_charts_out"
+          mkdir -p "${GITHUB_WORKSPACE}/_charts_cache"
+
+      - name: Pull chartmaker image
+        run: docker pull n129bz/chartmaker:latest
+
+      - name: Run chartmaker to build selected charts
+        # We:
+        #  1) mount a volume at /chartmaker/externalcharts so DBs land outside the container
+        #  2) flip webservermode to false (CI-friendly) before running
+        #  3) run the requested chart target, e.g. "full-all" or "area-single=33"
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/_charts_out:/chartmaker/externalcharts" \
+            -v "${GITHUB_WORKSPACE}/_charts_cache:/chartmaker/chartcache" \
+            n129bz/chartmaker:latest \
+            bash -lc '
+              cd /chartmaker
+              # Force CI mode (no webserver) and keep processing folders cleaned up
+              jq ".settings.webservermode=false | .settings.cleanprocessfolders=true | .settings.opendefaultbrowser=false" settings.json > settings.json.tmp && mv settings.json.tmp settings.json
+
+              if [ "${MAKE_VERBOSE}" = "true" ]; then
+                jq . settings.json
+              fi
+
+              # Kick off the requested build
+              node make ${CHART_ARGS}
+            '
+
+      - name: List generated databases (debug)
+        run: |
+          echo "Generated files:"
+          find "${GITHUB_WORKSPACE}/_charts_out" -type f -maxdepth 1 -printf "%f\n" || true
+
+      - name: Install AWS CLI for B2 S3 uploads
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y awscli
+
+      - name: Upload to Backblaze B2 (S3 API)
+        # Sync the generated DBs to s3://<bucket>/<prefix>/
+        run: |
+          set -euo pipefail
+          SRC="${GITHUB_WORKSPACE}/_charts_out"
+          DEST="s3://${B2_BUCKET}/${BUCKET_PREFIX}"
+          # Make files world-readable for CDN
+          aws s3 sync "${SRC}/" "${DEST}/" \
+            --endpoint-url "${B2_ENDPOINT}" \
+            --acl public-read \
+            --only-show-errors
+          echo "Uploaded to ${DEST}"
+
+      - name: (Optional) Purge Cloudflare cache
+        if: env.CF_API_TOKEN != '' && env.CF_ZONE_ID != ''
+        run: |
+          set -euo pipefail
+          # Purge all (simple & safe). If you prefer, change to a file list payload.
+          curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data '{"purge_everything":true}' \
+          | jq .
