@@ -95,6 +95,13 @@ jobs:
           if grep -n 'dbf.length' make.js >/dev/null 2>&1; then
             sed -i 's/(dbf.length > 0 && fs.existsSync(dbf))/(dbf && dbf.length > 0 && fs.existsSync(dbf))/' make.js
           fi
+      
+      - name: Disable webserver in settings.json (inside container)
+        working-directory: /chartmaker
+        run: |
+          set -euxo pipefail
+          apt-get update && apt-get install -y jq
+          jq '.settings.webservermode=false | .settings.opendefaultbrowser=false' settings.json > tmp && mv tmp settings.json
 
       # Run chartmaker inside the image
       - name: Run chartmaker to build selected charts (container)
