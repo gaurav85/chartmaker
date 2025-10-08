@@ -159,12 +159,12 @@ jobs:
           echo "============================================"
           
           # Run chartmaker directly
-          if [ -z "$COMMAND" ]; then
+          if [ -z "${{ steps.chart_command.outputs.command }}" ]; then
             echo "No command specified, processing all charts"
-            node make
+            node make.js
           else
             echo "Processing with command: $COMMAND"
-            node make $COMMAND
+            node make.js $COMMAND
           fi
           
           echo "============================================"
