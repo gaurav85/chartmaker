@@ -50,28 +50,32 @@ jobs:
       - name: Pull chartmaker image
         run: docker pull n129bz/chartmaker:latest
 
-      - name: Run chartmaker to build selected charts
-        # We:
-        #  1) mount a volume at /chartmaker/externalcharts so DBs land outside the container
-        #  2) flip webservermode to false (CI-friendly) before running
-        #  3) run the requested chart target, e.g. "full-all" or "area-single=33"
+      - name: Install jq (host)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Force CI settings on host (no webserver; clean folders)
+        run: |
+          set -euo pipefail
+          # Edit the repo's settings.json (checked out on host):
+          jq '.settings.webservermode=false
+              | .settings.cleanprocessfolders=true
+              | .settings.opendefaultbrowser=false' settings.json > settings.json.tmp
+          mv settings.json.tmp settings.json
+          echo "Effective settings:"
+          jq '.settings | {webservermode, cleanprocessfolders, opendefaultbrowser, defaultdbfolder, dbextension}' settings.json
+
+      - name: Run chartmaker to build selected charts (container)
         run: |
           set -euo pipefail
           docker run --rm \
+            --workdir /chartmaker \
+            -v "${GITHUB_WORKSPACE}/settings.json:/chartmaker/settings.json:ro" \
             -v "${GITHUB_WORKSPACE}/_charts_out:/chartmaker/externalcharts" \
             -v "${GITHUB_WORKSPACE}/_charts_cache:/chartmaker/chartcache" \
             n129bz/chartmaker:latest \
-            bash -lc '
-              cd /chartmaker
-              # Force CI mode (no webserver) and keep processing folders cleaned up
-              jq ".settings.webservermode=false | .settings.cleanprocessfolders=true | .settings.opendefaultbrowser=false" settings.json > settings.json.tmp && mv settings.json.tmp settings.json
-
-              if [ "${MAKE_VERBOSE}" = "true" ]; then
-                jq . settings.json
-              fi
-
-              # Kick off the requested build
-              node make ${CHART_ARGS}
+            node make "${CHART_ARGS}"
             '
 
       - name: List generated databases (debug)
