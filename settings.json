@@ -10,6 +10,7 @@
         "logtofile": false,
         "cleanprocessfolders": false,
 
+        
         "outputgrayscale": false,
         "tileimagequality" : 25,
         "blendpixels" : 30,
