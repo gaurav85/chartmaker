@@ -228,13 +228,18 @@ jobs:
           set -euxo pipefail
           DEST="b2://${B2_BUCKET}/tiles/${CHART_TYPE}/${TARGET_DATE}/"
           echo "Destination: $DEST"
+
+          # Show CLI version for future debugging
+          b2 version || true
+          echo "b2 sync help (first lines):"
+          b2 sync -h | head -n 20 || true
+
           while IFS= read -r ROOT; do
             echo "Syncing $ROOT -> $DEST"
+            # Portable flags: --noProgress and --threads are widely available
             b2 sync \
-              --keepDays 90 \
-              --replaceNewer \
+              --noProgress \
               --threads 16 \
-              --cacheControl "public, max-age=31536000, immutable" \
               "$ROOT/" "$DEST"
           done < "$TILE_ROOTS_FILE"
 
