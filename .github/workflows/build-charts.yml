@@ -11,7 +11,7 @@ jobs:
   process-charts:
     runs-on: ubuntu-latest
 
-    # Use the published chartmaker image and run all steps *inside* it.
+    # Run everything inside the chartmaker image
     container:
       image: n129bz/chartmaker:latest
 
@@ -19,23 +19,21 @@ jobs:
       fail-fast: false
       matrix:
         chart_type:
-          # VFR Sectionals = all sectional "areas"
+          # VFR sectionals = all sectional areas
           - { id: vfr,      args: "area-all" }
-          # IFR Enroute (Low/High) = indices in the "full" list
+          # IFR enroute low/high are indices 5 & 6 in the "full" list
           - { id: ifr_low,  args: "full-single=5" }
           - { id: ifr_high, args: "full-single=6" }
 
     env:
-      # Prevent chartmaker from launching its web server
-      WEBSERVERMODE: "false"
-      # Your Backblaze bucket name
-      B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+      WEBSERVERMODE: "false"                            # prevent webserver
+      B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}     # target B2 bucket
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Node & jq inside container
+      - name: Install Node & jq in container
         run: |
           set -euxo pipefail
           if ! command -v node >/dev/null 2>&1; then
@@ -52,13 +50,12 @@ jobs:
               echo "Unsupported base image"; exit 1
             fi
           else
-            # Ensure jq exists even if node already present
             (apt-get update && apt-get install -y jq) || true
           fi
           node -v
           jq --version
 
-      - name: Force CI settings (no web; KEEP intermediate tiles)
+      - name: Force CI settings (no web; keep intermediate tiles)
         working-directory: /chartmaker
         run: |
           set -euxo pipefail
@@ -67,12 +64,12 @@ jobs:
               | .settings.cleanprocessfolders=false' settings.json > s && mv s settings.json
           jq '.settings | {webservermode, opendefaultbrowser, cleanprocessfolders, zoomrange, tileimagequality}' settings.json
 
-      - name: Copy chartdates.json into container workspace
+      - name: Copy chartdates.json into container
         run: |
           set -euxo pipefail
           cp "$GITHUB_WORKSPACE/chartdates.json" /chartmaker/chartdates.json
 
-      # ----- B2 CLI setup (once per job) -----
+      # ---------- B2 CLI setup (once per job) ----------
       - name: Install B2 CLI (v4.x)
         run: |
           set -euxo pipefail
@@ -89,73 +86,52 @@ jobs:
           set -euxo pipefail
           b2 account authorize "${B2_KEY_ID}" "${B2_APP_KEY}"
 
-      # ----- Choose FAA date from chartdates.json -----
+      # ---------- Pick FAA date from MM-DD-YYYY list ----------
       - name: Select FAA chart date from chartdates.json
         id: pickdate
         working-directory: /chartmaker
         run: |
           set -euo pipefail
-
-          # 1) Read raw dates (MM-DD-YYYY) from ChartDates[]
           mapfile -t RAW < <(jq -r '.ChartDates[]' chartdates.json)
-
           if [ "${#RAW[@]}" -eq 0 ]; then
-            echo "No ChartDates[] entries found" >&2
-            exit 1
+            echo "No ChartDates[] entries found" >&2; exit 1
           fi
 
-          # 2) Normalize to ISO (YYYY-MM-DD) by string slicing (no printf => no octal issue)
           DATES=()
           for d in "${RAW[@]}"; do
-            # Expect strictly MM-DD-YYYY
             if [[ "$d" =~ ^([0-1][0-9])-([0-3][0-9])-(20[0-9]{2})$ ]]; then
               mm="${BASH_REMATCH[1]}"; dd="${BASH_REMATCH[2]}"; yyyy="${BASH_REMATCH[3]}"
               iso="${yyyy}-${mm}-${dd}"
-              # Validate with GNU date; skip invalid calendar combos just in case
               if epoch=$(date -u -d "$iso" +%s 2>/dev/null); then
                 DATES+=("$iso")
               fi
             fi
           done
-
           if [ "${#DATES[@]}" -eq 0 ]; then
-            echo "No valid dates after normalization" >&2
-            exit 1
+            echo "No valid dates after normalization" >&2; exit 1
           fi
 
-          # 3) Sort ISO dates lexicographically (works for YYYY-MM-DD)
           IFS=$'\n' read -r -d '' -a SORTED < <(printf "%s\n" "${DATES[@]}" | sort && printf '\0')
-
           TODAY_EPOCH="$(date -u +%s)"
-          PREV=""   # latest <= today
-          NEXT=""   # earliest > today
+          PREV=""; NEXT=""
 
           for iso in "${SORTED[@]}"; do
             epoch=$(date -u -d "$iso" +%s)
             if [ "$epoch" -le "$TODAY_EPOCH" ]; then
               PREV="$iso"
             else
-              if [ -z "$NEXT" ]; then
-                NEXT="$iso"
-              fi
+              if [ -z "$NEXT" ]; then NEXT="$iso"; fi
             fi
           done
 
-          if [ -n "$PREV" ]; then
-            TARGET="$PREV"
-          else
-            TARGET="$NEXT"
-          fi
-
+          if [ -n "$PREV" ]; then TARGET="$PREV"; else TARGET="$NEXT"; fi
           if [ -z "${TARGET:-}" ]; then
-            echo "Could not determine target date from: ${SORTED[*]}" >&2
-            exit 1
+            echo "Could not determine target date" >&2; exit 1
           fi
-
           echo "target_date=$TARGET" >> "$GITHUB_OUTPUT"
           echo "Selected FAA chart date: $TARGET (today=$(date -u +%Y-%m-%d))"
 
-      # ----- Skip build if B2 already has tiles for that date/type -----
+      # ---------- Check B2, skip if date already present ----------
       - name: Check B2 for existing tiles (skip if present)
         id: check_b2
         env:
@@ -164,19 +140,14 @@ jobs:
           TARGET_DATE: ${{ steps.pickdate.outputs.target_date }}
         run: |
           set -euo pipefail
-
           PREFIX="tiles/${CHART_TYPE}/${TARGET_DATE}/"
           echo "Checking bucket: ${B2_BUCKET}"
           echo "Folder/prefix:   ${PREFIX}"
 
-          # Correct usage: b2 ls <bucket> <prefix> --json
           OUT="$(b2 ls --json "${B2_BUCKET}" "${PREFIX}" 2>/dev/null || true)"
-
-          # For visibility (debug)
           echo "Raw b2 ls output (first 200 chars):"
           echo "${OUT}" | head -c 200; echo
 
-          # Interpret result robustly: empty, [], or array of file objects
           if echo "${OUT}" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
             COUNT=$(echo "${OUT}" | jq 'length')
             echo "Found ${COUNT} objects under ${PREFIX}"
@@ -186,7 +157,17 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # ----- Build if needed (keeps workarea tiles) -----
+      # ---------- Patch IFR High shapefile pattern (l->h) ----------
+      - name: Patch clip shape pattern for IFR High
+        if: matrix.chart_type.id == 'ifr_high'
+        working-directory: /chartmaker
+        run: |
+          set -euxo pipefail
+          # Replace any mistaken 'enr_lNN.shp' references in high flow with 'enr_hNN.shp'
+          grep -RIl 'enr_l..\.shp' . | xargs -r sed -i 's/enr_l\([0-9][0-9]\)\.shp/enr_h\1.shp/g'
+          ls -1 clipshapes/enroute_high || true
+
+      # ---------- Build if needed ----------
       - name: Build charts for ${{ matrix.chart_type.id }}
         if: steps.check_b2.outputs.exists != 'true'
         working-directory: /chartmaker
@@ -196,7 +177,7 @@ jobs:
           set -euxo pipefail
           node make "${{ matrix.chart_type.args }}"
 
-      # ----- Gather workarea tile roots -----
+      # ---------- Collect tile roots from workarea ----------
       - name: Locate tile roots
         if: steps.check_b2.outputs.exists != 'true'
         id: tiles
@@ -204,16 +185,18 @@ jobs:
           set -euo pipefail
           ROOT="/chartmaker/workarea"
           test -d "$ROOT" || { echo "No workarea found"; exit 1; }
+
+          # a tile root has children named 5,6,7... (zoom directories)
           mapfile -t TILE_ROOTS < <(find "$ROOT" -type d -maxdepth 3 -regex '.*/[0-9]+' -printf '%h\n' | sort -u)
           if [ ${#TILE_ROOTS[@]} -eq 0 ]; then
             echo "No tile folders detected in $ROOT" >&2; exit 1
           fi
           printf "%s\n" "${TILE_ROOTS[@]}" > /tmp/tile_roots.txt
           echo "tile_roots_file=/tmp/tile_roots.txt" >> "$GITHUB_OUTPUT"
-          echo "Found ${#TILE_ROOTS[@]} tile roots (showing first 10):"
+          echo "Found ${#TILE_ROOTS[@]} tile roots (first 10):"
           head -10 /tmp/tile_roots.txt || true
 
-      # ----- Upload tiles to a single prefix: tiles/<type>/<date>/{z}/{x}/{y}.webp -----
+      # ---------- Upload to B2 with valid v4 flags ----------
       - name: Upload tiles to B2 (no region in path)
         if: steps.check_b2.outputs.exists != 'true'
         env:
@@ -228,19 +211,17 @@ jobs:
           while IFS= read -r ROOT; do
             echo "Syncing $ROOT -> $DEST"
             b2 sync \
-              --keep-days 90 \
-              --replace-newer \
-              --incrementalMode \
+              --keepDays 90 \
+              --replaceNewer \
               --threads 16 \
-              --cache-control "public, max-age=31536000, immutable" \
+              --cacheControl "public, max-age=31536000, immutable" \
               "$ROOT/" "$DEST"
           done < "$TILE_ROOTS_FILE"
 
-          # Update the "latest" pointer for this chart type
           echo "${TARGET_DATE}" > "latest_${CHART_TYPE}.txt"
           b2 file upload --no-progress "${B2_BUCKET}" "latest_${CHART_TYPE}.txt" "latest_${CHART_TYPE}.txt"
 
-      # ----- Retain only the newest two date folders per type -----
+      # ---------- Retain only newest two date folders per type ----------
       - name: Retain only last two dates in B2
         env:
           B2_BUCKET:  ${{ secrets.B2_BUCKET_NAME }}
@@ -256,11 +237,9 @@ jobs:
               | sort -u
           )
           if [ ${#DATES[@]} -le 2 ]; then
-            echo "Nothing to prune (dates found: ${DATES[*]:-none})"
-            exit 0
+            echo "Nothing to prune (dates found: ${DATES[*]:-none})"; exit 0
           fi
-          KEEP1="${DATES[-1]}"
-          KEEP2="${DATES[-2]}"
+          KEEP1="${DATES[-1]}"; KEEP2="${DATES[-2]}"
           echo "Keeping: $KEEP2, $KEEP1"
           EMPTYDIR="$(mktemp -d)"
           for d in "${DATES[@]}"; do
@@ -271,7 +250,7 @@ jobs:
           done
           rmdir "$EMPTYDIR" || true
 
-      # ----- Purge Cloudflare so clients see new tiles -----
+      # ---------- Purge Cloudflare ----------
       - name: Purge Cloudflare cache
         env:
           CF_ZONE_ID:   ${{ secrets.CLOUDFLARE_ZONE_ID }}
@@ -286,7 +265,7 @@ jobs:
             -d '{"purge_everything":true}' \
             -w "\nHTTP Status: %{http_code}\n"
 
-      # ----- Simple report artifact per chart type -----
+      # ---------- Report & cleanup ----------
       - name: Create processing report
         if: always()
         env:
