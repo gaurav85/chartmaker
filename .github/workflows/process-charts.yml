@@ -30,17 +30,61 @@ jobs:
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
-          sudo docker image prune -af
+          sudo apt-get clean
           df -h
       
-      - name: Checkout code
+      - name: Checkout chartmaker repository
         uses: actions/checkout@v4
+        with:
+          repository: N129BZ/chartmaker
+          path: chartmaker
       
-      - name: Pull official chartmaker image
+      - name: Install system dependencies
         run: |
-          echo "Pulling official chartmaker image..."
-          docker pull n129bz/chartmaker:latest
-          docker images | grep chartmaker
+          sudo apt-get update
+          sudo apt-get install -y \
+            gdal-bin \
+            python3-gdal \
+            python3-pip \
+            python3-pil \
+            python3-requests \
+            nodejs \
+            npm \
+            curl \
+            unzip \
+            sqlite3 \
+            perl \
+            libperl-dev \
+            build-essential
+          
+          # Verify installations
+          gdalinfo --version
+          node --version
+          npm --version
+          python3 --version
+      
+      - name: Install Perl dependencies
+        working-directory: chartmaker
+        run: |
+          # Make perlinstall script executable and run it
+          chmod +x perlinstall.sh
+          sudo ./perlinstall.sh
+      
+      - name: Install Node.js dependencies
+        working-directory: chartmaker
+        run: |
+          npm install
+      
+      - name: Install Python dependencies
+        run: |
+          pip3 install --break-system-packages pillow requests
+      
+      - name: Setup chartmaker permissions
+        working-directory: chartmaker
+        run: |
+          chmod +x mergetiles.pl mbutil/mb-util
+          sudo ln -sf $(pwd)/mbutil/mb-util /usr/local/bin/mb-util
+          mkdir -p workarea chartcache public/charts
       
       - name: Install B2 CLI
         run: |
@@ -49,9 +93,11 @@ jobs:
           sudo mv b2-linux /usr/local/bin/b2
           b2 version
       
-      - name: Configure B2 credentials
+      - name: Configure B2
         run: |
-          b2 account authorize ${{ secrets.B2_KEY_ID }} ${{ secrets.B2_APPLICATION_KEY }}
+          b2 account authorize "${{ secrets.B2_KEY_ID }}" "${{ secrets.B2_KEY_KEY }}"
+          echo "✅ B2 authorization successful"
+          b2 account get
       
       - name: Determine chart command
         id: chart_command
@@ -101,38 +147,24 @@ jobs:
           echo "Chart command: '$COMMAND'"
       
       - name: Process charts
+        working-directory: chartmaker
         run: |
           COMMAND="${{ steps.chart_command.outputs.command }}"
           
           echo "============================================"
           echo "Starting chart processing"
           echo "Command: '$COMMAND'"
-          echo "Using official n129bz/chartmaker:latest image"
+          echo "Working directory: $(pwd)"
           echo "Processor count: $(nproc)"
           echo "============================================"
           
-          mkdir -p public/charts workarea chartcache
-          
-          # Use official n129bz/chartmaker image
-          # Note: Official image uses 'node make' not 'node make.js'
+          # Run chartmaker directly
           if [ -z "$COMMAND" ]; then
             echo "No command specified, processing all charts"
-            docker run --rm \
-              --entrypoint /bin/sh \
-              -v $(pwd)/public:/chartmaker/public \
-              -v $(pwd)/workarea:/chartmaker/workarea \
-              -v $(pwd)/chartcache:/chartmaker/chartcache \
-              n129bz/chartmaker:latest \
-              -c "cd /chartmaker && node make"
+            node make
           else
             echo "Processing with command: $COMMAND"
-            docker run --rm \
-              --entrypoint /bin/sh \
-              -v $(pwd)/public:/chartmaker/public \
-              -v $(pwd)/workarea:/chartmaker/workarea \
-              -v $(pwd)/chartcache:/chartmaker/chartcache \
-              n129bz/chartmaker:latest \
-              -c "cd /chartmaker && node make $COMMAND"
+            node make $COMMAND
           fi
           
           echo "============================================"
@@ -142,9 +174,9 @@ jobs:
           echo "============================================"
       
       - name: Get chart date
+        working-directory: chartmaker
         id: chart_date
         run: |
-          # Find the most recent chart directory
           if [ ! -d "public/charts" ]; then
             echo "ERROR: public/charts directory doesn't exist"
             exit 1
@@ -163,6 +195,7 @@ jobs:
           echo "Charts processed for date: $CHART_DATE"
       
       - name: Validate charts
+        working-directory: chartmaker
         run: |
           CHART_DATE="${{ steps.chart_date.outputs.chart_date }}"
           
@@ -173,7 +206,6 @@ jobs:
             exit 1
           fi
           
-          # Count files
           FILE_COUNT=$(find public/charts/$CHART_DATE -type f 2>/dev/null | wc -l)
           echo "Found $FILE_COUNT files"
           
@@ -184,7 +216,6 @@ jobs:
             exit 1
           fi
           
-          # Get total size
           TOTAL_SIZE=$(du -sh public/charts/$CHART_DATE | cut -f1)
           
           echo "============================================"
@@ -195,6 +226,7 @@ jobs:
           echo "============================================"
       
       - name: Upload to Backblaze
+        working-directory: chartmaker
         env:
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
         run: |
@@ -206,7 +238,6 @@ jobs:
           echo "Destination: b2://$B2_BUCKET/$CHART_DATE"
           echo "============================================"
           
-          # Sync to B2
           b2 sync --no-progress --threads 8 \
             public/charts/$CHART_DATE \
             b2://$B2_BUCKET/$CHART_DATE
@@ -215,19 +246,15 @@ jobs:
       
       - name: Purge Cloudflare cache
         if: success()
-        env:
-          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
         run: |
-          if [ -n "$CLOUDFLARE_API_KEY" ] && [ -n "$CLOUDFLARE_ZONE_ID" ]; then
+          if [ -n "${{ secrets.CLOUDFLARE_ZONE_ID }}" ] && [ -n "${{ secrets.CLOUDFLARE_API_KEY }}" ]; then
             echo "Purging Cloudflare cache..."
             
-            RESPONSE=$(curl https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache \
-          -H 'Content-Type: application/json' \
-          -H "X-Auth-Email: ${{ secrets.CLOUDFLARE_API_EMAIL }}" \
-          -H "X-Auth-Key: ${{ secrets.CLOUDFLARE_API_KEY }}" \
-          -d '{"purge_everything":true}' \
-          -w "\nHTTP Status: %{http_code}\n")
+            RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+              -H "X-Auth-Email: ${{ secrets.CLOUDFLARE_API_EMAIL }}" \
+              -H "X-Auth-Key: ${{ secrets.CLOUDFLARE_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              --data '{"purge_everything":true}')
             
             echo "Response: $RESPONSE"
             
@@ -258,9 +285,9 @@ jobs:
       
       - name: Cleanup
         if: always()
+        working-directory: chartmaker
         run: |
           echo "Cleaning up work directories..."
-          sudo rm -rf workarea/* chartcache/* || true
-          docker system prune -af
+          rm -rf workarea/* chartcache/* || true
           echo "✅ Cleanup completed"
           df -h
