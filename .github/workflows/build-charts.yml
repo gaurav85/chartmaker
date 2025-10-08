@@ -96,40 +96,48 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1) Extract all ISO dates from anywhere in the JSON (string values or .date/.Date fields)
-          mapfile -t DATES < <(
-            jq -r '
-              # collect values explicitly named .date/.Date, plus any string values
-              (.. | .date? // .Date? // empty),
-              (.. | select(type == "string"))
-              # keep only proper YYYY-MM-DD strings
-              | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))
-            ' chartdates.json \
-            | sort -u
-          )
+          # 1) Read raw dates (MM-DD-YYYY) from ChartDates[]
+          mapfile -t RAW < <(jq -r '.ChartDates[]' chartdates.json)
 
-          if [ "${#DATES[@]}" -eq 0 ]; then
-            echo "No ISO dates found in chartdates.json" >&2
+          if [ "${#RAW[@]}" -eq 0 ]; then
+            echo "No ChartDates[] entries found" >&2
             exit 1
           fi
 
-          # 2) Pick latest <= today, else earliest > today
+          # 2) Normalize to ISO (YYYY-MM-DD) without using jq strptime
+          DATES=()
+          for d in "${RAW[@]}"; do
+            # Expect strictly MM-DD-YYYY
+            if [[ "$d" =~ ^([0-9]{2})-([0-9]{2})-([0-9]{4})$ ]]; then
+              mm="${BASH_REMATCH[1]}"; dd="${BASH_REMATCH[2]}"; yyyy="${BASH_REMATCH[3]}"
+              iso=$(printf "%04d-%02d-%02d" "$yyyy" "$mm" "$dd")
+              # Validate with GNU date (guard bad calendar entries)
+              if epoch=$(date -u -d "$iso" +%s 2>/dev/null); then
+                DATES+=("$iso")
+              fi
+            fi
+          done
+
+          if [ "${#DATES[@]}" -eq 0 ]; then
+            echo "No valid dates after normalization" >&2
+            exit 1
+          fi
+
+          # 3) Sort ISO dates lexicographically (works for YYYY-MM-DD)
+          IFS=$'\n' read -r -d '' -a SORTED < <(printf "%s\n" "${DATES[@]}" | sort && printf '\0')
+
           TODAY_EPOCH="$(date -u +%s)"
           PREV=""
           NEXT=""
 
-          for d in "${DATES[@]}"; do
-            # skip invalid calendars just in case
-            if ! EPOCH="$(date -u -d "$d" +%s 2>/dev/null)"; then
-              continue
-            fi
-            if [ "$EPOCH" -le "$TODAY_EPOCH" ]; then
-              PREV="$d"
+          for iso in "${SORTED[@]}"; do
+            epoch=$(date -u -d "$iso" +%s)
+            if [ "$epoch" -le "$TODAY_EPOCH" ]; then
+              PREV="$iso"
             else
-              if [ -z "${NEXT:-}" ]; then
-                NEXT="$d"
+              if [ -z "$NEXT" ]; then
+                NEXT="$iso"
               fi
-              # we keep scanning to finalize PREV, but don't overwrite NEXT once set
             fi
           done
 
@@ -140,7 +148,7 @@ jobs:
           fi
 
           if [ -z "${TARGET:-}" ]; then
-            echo "Could not determine target date from: ${DATES[*]}" >&2
+            echo "Could not determine target date from: ${SORTED[*]}" >&2
             exit 1
           fi
 
