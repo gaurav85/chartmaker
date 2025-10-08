@@ -42,7 +42,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-            - name: Prepare output & cache
+      - name: Prepare output & cache
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/_charts_out"
           mkdir -p "${GITHUB_WORKSPACE}/_charts_cache"
