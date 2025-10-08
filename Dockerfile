@@ -28,8 +28,24 @@ RUN apt-get install -y \
     build-essential \
     libgdal-dev \
     libssl-dev \
-    gdal-bin=3.11* \
+    curl \
+    cmake \
+    ninja-build \
+    libtiff-dev \
+    libgeotiff-dev \
+    libproj-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Download and build GDAL 3.11.1
+RUN curl -LO https://github.com/OSGeo/gdal/releases/download/v3.11.1/gdal-3.11.1.tar.gz && \
+    tar xzf gdal-3.11.1.tar.gz && \
+    cd gdal-3.11.1 && \
+    mkdir build && cd build && \
+    cmake .. -G Ninja -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    ninja && ninja install
+
+# Clean up
+RUN rm -rf /gdal-3.11.1 /gdal-3.11.1.tar.gz
 
 # Verify Node.js version
 RUN node --version && npm --version
