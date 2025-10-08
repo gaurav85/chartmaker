@@ -1,122 +1,124 @@
-name: Build & Publish FAA Charts
+name: Build FAA charts and upload to B2
 
 on:
   workflow_dispatch:
     inputs:
       chart_args:
-        description: "chartmaker CLI arg (e.g. full-all, full-single=3, area-single=33)"
+        description: 'Chartmaker args (e.g., area-single=12, full-single=0, area-all)'
         required: true
-        default: "full-single=0"
+        default: 'area-single=12'
       bucket_prefix:
-        description: "Prefix/folder in the B2 bucket (e.g. charts/prod)"
+        description: 'Prefix inside the B2 bucket (e.g., charts/prod)'
         required: true
-        default: "charts/prod"
-      make_verbose:
-        description: "Set to true to print chartmaker logs to console"
-        required: true
-        default: "false"
+        default: 'charts/prod'
 
 jobs:
-  build-publish:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 1440  # long runs are common when tiling
+
+    # Use the prebuilt chartmaker image so Node, GDAL, etc. are ready.
+    container:
+      image: n129bz/chartmaker:latest
+      options: >-
+        --entrypoint /bin/bash
 
     env:
-      # Backblaze S3-compatible creds
+      # Backblaze B2 S3 credentials (from your repo secrets)
       AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-      AWS_DEFAULT_REGION: us-west-002
-      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}     # e.g., https://s3.us-west-004.backblazeb2.com
       B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
-
-      # Cloudflare (optional purge)
+      # Cloudflare (optional)
       CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CF_ZONE_ID: ${{ secrets.CLOUDFlARE_ZONE_ID }}
-
-      # Job inputs
+      CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      # Workflow inputs
       CHART_ARGS: ${{ github.event.inputs.chart_args }}
       BUCKET_PREFIX: ${{ github.event.inputs.bucket_prefix }}
-      MAKE_VERBOSE: ${{ github.event.inputs.make_verbose }}
+      # Verbose command logging from chartmaker? (true/false)
+      MAKE_VERBOSE: "false"
 
     steps:
-      - name: Checkout repo
+      - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Prepare output & cache
+      - name: Show environment (debug)
         run: |
-          mkdir -p "${GITHUB_WORKSPACE}/_charts_out"
-          mkdir -p "${GITHUB_WORKSPACE}/_charts_cache"
+          set -euxo pipefail
+          node -v
+          gdalinfo --version || true
+          echo "CHART_ARGS: $CHART_ARGS"
+          echo "B2_BUCKET: $B2_BUCKET"
+          echo "BUCKET_PREFIX: $BUCKET_PREFIX"
+          echo "B2_ENDPOINT: $B2_ENDPOINT"
 
-      - name: Build “chartmaker-with-node” image (adds Node + jq)
+      # --- TEMP PATCH: guard an undefined 'dbf' in make.js (prevents your TypeError) ---
+      - name: Patch chartmaker for dbf null-guard
+        working-directory: /chartmaker
         run: |
-          cat > Dockerfile.ci <<'EOF'
-          FROM n129bz/chartmaker:latest
-          # Install Node.js 18 LTS and jq
-          RUN apt-get update && \
-              apt-get install -y curl ca-certificates gnupg && \
-              mkdir -p /etc/apt/keyrings && \
-              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
-              echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
-              apt-get update && \
-              apt-get install -y nodejs jq && \
-              node -v && npm -v && \
-              apt-get clean && rm -rf /var/lib/apt/lists/*
-          WORKDIR /chartmaker
-          EOF
-          docker build -t chartmaker-with-node -f Dockerfile.ci .
+          set -euxo pipefail
+          # Only patch if the line exists and hasn't been patched already
+          if grep -n 'dbf.length' make.js >/dev/null 2>&1; then
+            sed -i 's/(dbf.length > 0 && fs.existsSync(dbf))/(dbf && dbf.length > 0 && fs.existsSync(dbf))/' make.js
+          fi
 
-      - name: Force CI settings on host (no webserver; clean folders)
-        run: |
-          set -euo pipefail
-          # Edit the repo’s settings.json on the host
-          sudo apt-get update -y && sudo apt-get install -y jq
-          jq '.settings.webservermode=false
-              | .settings.cleanprocessfolders=true
-              | .settings.opendefaultbrowser=false' settings.json > settings.json.tmp
-          mv settings.json.tmp settings.json
-          jq '.settings | {webservermode, cleanprocessfolders, opendefaultbrowser, defaultdbfolder, dbextension}' settings.json
-
+      # Run chartmaker inside the image
       - name: Run chartmaker to build selected charts (container)
+        working-directory: /chartmaker
+        env:
+          # Let chartmaker write DBs into its default folder (/chartmaker/public/charts)
+          # You can change the default in settings.json if you want a different path.
+          MAKE_VERBOSE: ${{ env.MAKE_VERBOSE }}
         run: |
-          set -euo pipefail
-          docker run --rm \
-            --workdir /chartmaker \
-            -v "${GITHUB_WORKSPACE}/settings.json:/chartmaker/settings.json:ro" \
-            -v "${GITHUB_WORKSPACE}/_charts_out:/chartmaker/externalcharts" \
-            -v "${GITHUB_WORKSPACE}/_charts_cache:/chartmaker/chartcache" \
-            chartmaker-with-node \
-            node make "${CHART_ARGS}"
+          set -euxo pipefail
+
+          # (Optional) show chosen settings for reproducibility
+          node make -s || true
+
+          # Build the selected chart(s) using command-line args
+          # Examples:
+          #   area-single=12     -> a single sectional area by index (0..52)
+          #   area-all           -> all sectional areas
+          #   full-single=0      -> "Sectional" full bundle
+          #   full-single=7      -> "US_VFR_Wall_Planning"
+          node make "$CHART_ARGS"
 
       - name: List generated databases (debug)
         run: |
-          echo "Generated files:"
-          find "${GITHUB_WORKSPACE}/_charts_out" -type f -maxdepth 1 -printf "%f\n" || true
+          set -euxo pipefail
+          find /chartmaker/public/charts -maxdepth 1 -type f -name '*.db' -printf "%f\n" || true
 
       - name: Install AWS CLI for B2 S3 uploads
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y awscli
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y curl unzip groff less
+          curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli || true
+          aws --version
 
       - name: Upload to Backblaze B2 (S3 API)
-        # Sync the generated DBs to s3://<bucket>/<prefix>/
+        env:
+          AWS_DEFAULT_REGION: us-west-004
         run: |
-          set -euo pipefail
-          SRC="${GITHUB_WORKSPACE}/_charts_out"
-          DEST="s3://${B2_BUCKET}/${BUCKET_PREFIX}"
-          # Make files world-readable for CDN
-          aws s3 sync "${SRC}/" "${DEST}/" \
-            --endpoint-url "${B2_ENDPOINT}" \
-            --acl public-read \
-            --only-show-errors
-          echo "Uploaded to ${DEST}"
+          set -euxo pipefail
+          SRC_DIR="/chartmaker/public/charts"
+          # Create a manifest and upload every .db produced
+          shopt -s nullglob
+          for f in "$SRC_DIR"/*.db; do
+            base="$(basename "$f")"
+            dest="s3://${B2_BUCKET}/${BUCKET_PREFIX}/${base}"
+            echo "Uploading $f -> $dest"
+            aws s3 cp "$f" "$dest" --endpoint-url "${B2_ENDPOINT}" --only-show-errors
+          done
 
       - name: (Optional) Purge Cloudflare cache
-        if: env.CF_API_TOKEN != '' && env.CF_ZONE_ID != ''
+        if: ${{ env.CF_API_TOKEN && env.CF_ZONE_ID }}
         run: |
-          set -euo pipefail
-          # Purge all (simple & safe). If you prefer, change to a file list payload.
+          set -euxo pipefail
+          # Purge whole zone cache so the CDN serves fresh db URLs
           curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json" \
             --data '{"purge_everything":true}' \
-          | jq .
+            | tee /dev/stderr
