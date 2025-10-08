@@ -104,14 +104,14 @@ jobs:
             exit 1
           fi
 
-          # 2) Normalize to ISO (YYYY-MM-DD) without using jq strptime
+          # 2) Normalize to ISO (YYYY-MM-DD) by string slicing (no printf => no octal issue)
           DATES=()
           for d in "${RAW[@]}"; do
             # Expect strictly MM-DD-YYYY
-            if [[ "$d" =~ ^([0-9]{2})-([0-9]{2})-([0-9]{4})$ ]]; then
+            if [[ "$d" =~ ^([0-1][0-9])-([0-3][0-9])-(20[0-9]{2})$ ]]; then
               mm="${BASH_REMATCH[1]}"; dd="${BASH_REMATCH[2]}"; yyyy="${BASH_REMATCH[3]}"
-              iso=$(printf "%04d-%02d-%02d" "$yyyy" "$mm" "$dd")
-              # Validate with GNU date (guard bad calendar entries)
+              iso="${yyyy}-${mm}-${dd}"
+              # Validate with GNU date; skip invalid calendar combos just in case
               if epoch=$(date -u -d "$iso" +%s 2>/dev/null); then
                 DATES+=("$iso")
               fi
@@ -127,8 +127,8 @@ jobs:
           IFS=$'\n' read -r -d '' -a SORTED < <(printf "%s\n" "${DATES[@]}" | sort && printf '\0')
 
           TODAY_EPOCH="$(date -u +%s)"
-          PREV=""
-          NEXT=""
+          PREV=""   # latest <= today
+          NEXT=""   # earliest > today
 
           for iso in "${SORTED[@]}"; do
             epoch=$(date -u -d "$iso" +%s)
@@ -154,7 +154,6 @@ jobs:
 
           echo "target_date=$TARGET" >> "$GITHUB_OUTPUT"
           echo "Selected FAA chart date: $TARGET (today=$(date -u +%Y-%m-%d))"
-
 
       # ----- Skip build if B2 already has tiles for that date/type -----
       - name: Check B2 for existing tiles (skip if present)
