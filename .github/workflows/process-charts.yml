@@ -91,21 +91,17 @@ jobs:
           echo "command2=$COMMAND2" >> $GITHUB_OUTPUT
           echo "Processing with command: $COMMAND"
       
-      - name: Process charts
+      - name: Process charts (Part 1)
         run: |
-          COMMAND="${{ steps.chart_command.outputs.command }}"
-          echo "Starting chart processing: $COMMAND"
-          echo "Processor count = $(nproc)"
+          echo "Starting chart processing: ${{ steps.chart_command.outputs.command }}"
           
-          mkdir -p public/charts
-          
-          # Pass command directly without bash -c
+          # Run chartmaker in Docker
           docker run --rm \
             -v $(pwd)/public:/chartmaker/public \
             -v $(pwd)/workarea:/chartmaker/workarea \
             -v $(pwd)/chartcache:/chartmaker/chartcache \
             chartmaker:latest \
-            node make.js $COMMAND
+            bash -c "cd /chartmaker && node make.js ${{ steps.chart_command.outputs.command }}"
           
           echo "Chart processing completed"
           ls -lh public/charts/
@@ -113,17 +109,15 @@ jobs:
       - name: Process charts (Part 2 - if everything)
         if: github.event.inputs.chart_type == 'everything'
         run: |
-          COMMAND2="${{ steps.chart_command.outputs.command2 }}"
-          
-          if [ ! -z "$COMMAND2" ]; then
-            echo "Starting second batch: $COMMAND2"
+          if [ ! -z "${{ steps.chart_command.outputs.command2 }}" ]; then
+            echo "Starting second batch: ${{ steps.chart_command.outputs.command2 }}"
             
             docker run --rm \
               -v $(pwd)/public:/chartmaker/public \
               -v $(pwd)/workarea:/chartmaker/workarea \
               -v $(pwd)/chartcache:/chartmaker/chartcache \
               chartmaker:latest \
-              cd /chartmaker && node make.js $COMMAND2
+              bash -c "cd /chartmaker && node make.js ${{ steps.chart_command.outputs.command2 }}"
           fi
       
       - name: Get chart date
