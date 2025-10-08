@@ -164,14 +164,26 @@ jobs:
           TARGET_DATE: ${{ steps.pickdate.outputs.target_date }}
         run: |
           set -euo pipefail
-          PREFIX="b2://${B2_BUCKET}/tiles/${CHART_TYPE}/${TARGET_DATE}/"
-          echo "Checking $PREFIX"
-          if b2 ls "$PREFIX" --json | head -n1 | grep -q .; then
+
+          PREFIX="tiles/${CHART_TYPE}/${TARGET_DATE}/"
+          echo "Checking bucket: ${B2_BUCKET}"
+          echo "Folder/prefix:   ${PREFIX}"
+
+          # Correct usage: b2 ls <bucket> <prefix> --json
+          OUT="$(b2 ls --json "${B2_BUCKET}" "${PREFIX}" 2>/dev/null || true)"
+
+          # For visibility (debug)
+          echo "Raw b2 ls output (first 200 chars):"
+          echo "${OUT}" | head -c 200; echo
+
+          # Interpret result robustly: empty, [], or array of file objects
+          if echo "${OUT}" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            COUNT=$(echo "${OUT}" | jq 'length')
+            echo "Found ${COUNT} objects under ${PREFIX}"
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tiles already present at $PREFIX — skipping build/upload."
           else
+            echo "No objects found under ${PREFIX}"
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "No tiles at $PREFIX — will build and upload."
           fi
 
       # ----- Build if needed (keeps workarea tiles) -----
