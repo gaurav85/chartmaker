@@ -117,7 +117,7 @@ jobs:
             apt-get update
             apt-get install -y python3-pip
           fi
-          pip3 install --upgrade "b2[full]"
+          pip3 install --upgrade "b2[full]" --break-system-packages
 
       - name: Configure B2 credentials
         env:
