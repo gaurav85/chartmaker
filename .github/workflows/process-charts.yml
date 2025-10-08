@@ -95,7 +95,7 @@ jobs:
       
       - name: Configure B2
         run: |
-          b2 account authorize "${{ secrets.B2_KEY_ID }}" "${{ secrets.B2_KEY_KEY }}"
+          b2 account authorize "${{ secrets.B2_KEY_ID }}" "${{ secrets.B2_APP_KEY }}"
           echo "✅ B2 authorization successful"
           b2 account get
       
