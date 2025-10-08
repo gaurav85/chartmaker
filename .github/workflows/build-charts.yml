@@ -1,16 +1,7 @@
-name: Build FAA charts and upload to B2
+name: Build FAA tiles and publish to B2 (pan-able, no region)
 
 on:
   workflow_dispatch:
-    inputs:
-      chart_args:
-        description: 'Chartmaker args (e.g., area-single=12, full-single=0, area-all)'
-        required: true
-        default: 'area-single=12'
-      chart_type:
-        description: 'Friendly chart type label for the report (e.g., sectional, full)'
-        required: true
-        default: 'sectional'
 
 defaults:
   run:
@@ -20,129 +11,211 @@ jobs:
   process-charts:
     runs-on: ubuntu-latest
 
-    # Use the published image; we’ll add Node+jq inside the job.
+    # Use the published chartmaker image and run all steps *inside* it.
     container:
       image: n129bz/chartmaker:latest
 
-    env:
-      # Prevent chartmaker from starting the web server
-      WEBSERVERMODE: "false"
+    strategy:
+      fail-fast: false
+      matrix:
+        chart_type:
+          # VFR Sectionals = all sectional "areas"
+          - { id: vfr,      args: "area-all" }
+          # IFR Enroute (Low/High) = indices in the "full" list
+          - { id: ifr_low,  args: "full-single=5" }
+          - { id: ifr_high, args: "full-single=6" }
 
-      # B2 bucket (so we can refer to it in multiple steps)
+    env:
+      # Prevent chartmaker from launching its web server
+      WEBSERVERMODE: "false"
+      # Your Backblaze bucket name
       B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
 
     steps:
-      - name: Check out repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Install Node & jq inside container
         run: |
           set -euxo pipefail
-          if command -v node >/dev/null 2>&1; then node -v; else
+          if ! command -v node >/dev/null 2>&1; then
             if command -v apt-get >/dev/null 2>&1; then
               apt-get update
               apt-get install -y curl ca-certificates gnupg jq
               mkdir -p /etc/apt/keyrings
-              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-                | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-              echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" \
-                > /etc/apt/sources.list.d/nodesource.list
-              apt-get update
-              apt-get install -y nodejs
+              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+              echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+              apt-get update && apt-get install -y nodejs
             elif command -v apk >/dev/null 2>&1; then
               apk add --no-cache nodejs-current npm jq
-            elif command -v yum >/dev/null 2>&1; then
-              yum install -y jq
-              curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
-              yum install -y nodejs
             else
-              echo "Unsupported base image: could not install Node." >&2
-              exit 1
+              echo "Unsupported base image"; exit 1
             fi
+          else
+            # Ensure jq exists even if node already present
+            (apt-get update && apt-get install -y jq) || true
           fi
           node -v
+          jq --version
 
-      - name: Patch chartmaker (defensive null-guard)
+      - name: Force CI settings (no web; KEEP intermediate tiles)
         working-directory: /chartmaker
         run: |
           set -euxo pipefail
-          if grep -n 'dbf.length' make.js >/dev/null 2>&1; then
-            sed -i 's/(dbf.length > 0 && fs.existsSync(dbf))/(dbf && dbf.length > 0 && fs.existsSync(dbf))/' make.js
-          fi
+          jq '.settings.webservermode=false
+              | .settings.opendefaultbrowser=false
+              | .settings.cleanprocessfolders=false' settings.json > s && mv s settings.json
+          jq '.settings | {webservermode, opendefaultbrowser, cleanprocessfolders, zoomrange, tileimagequality}' settings.json
 
-      - name: Disable webserver in settings.json (inside container)
-        working-directory: /chartmaker
+      - name: Copy chartdates.json into container workspace
         run: |
           set -euxo pipefail
-          apt-get update && apt-get install -y jq
-          jq '.settings.webservermode=false | .settings.opendefaultbrowser=false' settings.json > tmp && mv tmp settings.json
+          cp "$GITHUB_WORKSPACE/chartdates.json" /chartmaker/chartdates.json
 
-      - name: Build charts (no webserver)
-        working-directory: /chartmaker
-        env:
-          WEBSERVERMODE: "false"
-        run: |
-          set -euxo pipefail
-          node make "${{ github.event.inputs.chart_args }}"
-
-      - name: Find charts output (path + date)
-        id: chart_meta
-        run: |
-          set -euo pipefail
-          ROOT=""
-          if [ -d "/chartmaker/charts" ]; then
-            ROOT="/chartmaker/charts"
-          elif [ -d "/chartmaker/public/charts" ]; then
-            ROOT="/chartmaker/public/charts"
-          else
-            echo "No charts directory found" >&2; exit 1
-          fi
-          # choose newest subdir if present; otherwise use root
-          if find "$ROOT" -mindepth 1 -maxdepth 1 -type d | grep -q . ; then
-            CHART_DIR="$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | sort | tail -n1)"
-          else
-            CHART_DIR="$ROOT"
-          fi
-          CHART_DATE="$(date -u +%Y-%m-%d)"
-          echo "chart_dir=$CHART_DIR"   >> "$GITHUB_OUTPUT"
-          echo "chart_date=$CHART_DATE" >> "$GITHUB_OUTPUT"
-          echo "Using CHART_DIR=$CHART_DIR  CHART_DATE=$CHART_DATE"
-          echo "Preview:"
-          find "$CHART_DIR" -maxdepth 1 -type f -name '*.db' -printf '%f\n' | head -20 || true
-
+      # ----- B2 CLI setup (once per job) -----
       - name: Install B2 CLI (v4.x)
         run: |
           set -euxo pipefail
           if ! command -v pip3 >/dev/null 2>&1; then
-            apt-get update
-            apt-get install -y python3-pip
+            apt-get update && apt-get install -y python3-pip
           fi
           pip3 install --upgrade "b2[full]" --break-system-packages
 
       - name: Configure B2 credentials
         env:
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_KEY_ID:  ${{ secrets.B2_KEY_ID }}
           B2_APP_KEY: ${{ secrets.B2_APPLICATION_KEY }}
         run: |
           set -euxo pipefail
           b2 account authorize "${B2_KEY_ID}" "${B2_APP_KEY}"
 
-      - name: Upload to Backblaze B2 (sync + latest.txt)
+      # ----- Choose FAA date from chartdates.json -----
+      - name: Select FAA chart date from chartdates.json
+        id: pickdate
+        working-directory: /chartmaker
+        run: |
+          set -euo pipefail
+          TODAY="$(date -u +%Y-%m-%d)"
+          TARGET="$(
+            jq -r --arg today "$TODAY" '
+              [ .[] | {d: ., t: (strptime("%Y-%m-%d") | mktime)} ] 
+              | sort_by(.t)
+              | ( [ .[] | select(.t <= (strptime($today)|mktime)) ] | last // empty ),
+                ( [ .[] | select(.t >  (strptime($today)|mktime)) ] | first // empty )
+              | select(.) | .d
+            ' chartdates.json | head -n1
+          )"
+          if [ -z "$TARGET" ]; then
+            echo "No dates found in chartdates.json" >&2; exit 1
+          fi
+          echo "target_date=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Selected FAA chart date: $TARGET (today=$TODAY)"
+
+      # ----- Skip build if B2 already has tiles for that date/type -----
+      - name: Check B2 for existing tiles (skip if present)
+        id: check_b2
         env:
-          CHART_DIR:  ${{ steps.chart_meta.outputs.chart_dir }}
-          CHART_DATE: ${{ steps.chart_meta.outputs.chart_date }}
-          B2_BUCKET:  ${{ env.B2_BUCKET_NAME }}
+          B2_BUCKET:  ${{ secrets.B2_BUCKET_NAME }}
+          CHART_TYPE: ${{ matrix.chart_type.id }}
+          TARGET_DATE: ${{ steps.pickdate.outputs.target_date }}
+        run: |
+          set -euo pipefail
+          PREFIX="b2://${B2_BUCKET}/tiles/${CHART_TYPE}/${TARGET_DATE}/"
+          echo "Checking $PREFIX"
+          if b2 ls "$PREFIX" --json | head -n1 | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tiles already present at $PREFIX — skipping build/upload."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No tiles at $PREFIX — will build and upload."
+          fi
+
+      # ----- Build if needed (keeps workarea tiles) -----
+      - name: Build charts for ${{ matrix.chart_type.id }}
+        if: steps.check_b2.outputs.exists != 'true'
+        working-directory: /chartmaker
+        env:
+          WEBSERVERMODE: "false"
         run: |
           set -euxo pipefail
-          test -d "${CHART_DIR}"
-          echo "Uploading ${CHART_DIR} -> b2://${B2_BUCKET}/${CHART_DATE}/"
-          b2 sync --keep-days 90 --replace-newer \
-            "${CHART_DIR}/" "b2://${B2_BUCKET}/${CHART_DATE}/"
+          node make "${{ matrix.chart_type.args }}"
 
-          echo "${CHART_DATE}" > latest.txt
-          b2 file upload --no-progress "${B2_BUCKET}" latest.txt latest.txt
-          echo "Upload complete and latest.txt updated"
+      # ----- Gather workarea tile roots -----
+      - name: Locate tile roots
+        if: steps.check_b2.outputs.exists != 'true'
+        id: tiles
+        run: |
+          set -euo pipefail
+          ROOT="/chartmaker/workarea"
+          test -d "$ROOT" || { echo "No workarea found"; exit 1; }
+          mapfile -t TILE_ROOTS < <(find "$ROOT" -type d -maxdepth 3 -regex '.*/[0-9]+' -printf '%h\n' | sort -u)
+          if [ ${#TILE_ROOTS[@]} -eq 0 ]; then
+            echo "No tile folders detected in $ROOT" >&2; exit 1
+          fi
+          printf "%s\n" "${TILE_ROOTS[@]}" > /tmp/tile_roots.txt
+          echo "tile_roots_file=/tmp/tile_roots.txt" >> "$GITHUB_OUTPUT"
+          echo "Found ${#TILE_ROOTS[@]} tile roots (showing first 10):"
+          head -10 /tmp/tile_roots.txt || true
 
+      # ----- Upload tiles to a single prefix: tiles/<type>/<date>/{z}/{x}/{y}.webp -----
+      - name: Upload tiles to B2 (no region in path)
+        if: steps.check_b2.outputs.exists != 'true'
+        env:
+          TILE_ROOTS_FILE: ${{ steps.tiles.outputs.tile_roots_file }}
+          B2_BUCKET:       ${{ secrets.B2_BUCKET_NAME }}
+          CHART_TYPE:      ${{ matrix.chart_type.id }}
+          TARGET_DATE:     ${{ steps.pickdate.outputs.target_date }}
+        run: |
+          set -euxo pipefail
+          DEST="b2://${B2_BUCKET}/tiles/${CHART_TYPE}/${TARGET_DATE}/"
+          echo "Destination: $DEST"
+          while IFS= read -r ROOT; do
+            echo "Syncing $ROOT -> $DEST"
+            b2 sync \
+              --keep-days 90 \
+              --replace-newer \
+              --incrementalMode \
+              --threads 16 \
+              --cache-control "public, max-age=31536000, immutable" \
+              "$ROOT/" "$DEST"
+          done < "$TILE_ROOTS_FILE"
+
+          # Update the "latest" pointer for this chart type
+          echo "${TARGET_DATE}" > "latest_${CHART_TYPE}.txt"
+          b2 file upload --no-progress "${B2_BUCKET}" "latest_${CHART_TYPE}.txt" "latest_${CHART_TYPE}.txt"
+
+      # ----- Retain only the newest two date folders per type -----
+      - name: Retain only last two dates in B2
+        env:
+          B2_BUCKET:  ${{ secrets.B2_BUCKET_NAME }}
+          CHART_TYPE: ${{ matrix.chart_type.id }}
+        run: |
+          set -euxo pipefail
+          PREFIX="tiles/${CHART_TYPE}/"
+          mapfile -t DATES < <(
+            b2 ls "b2://${B2_BUCKET}/${PREFIX}" --json \
+              | jq -r '.[].fileName' \
+              | awk -v p="$PREFIX" -F'/' 'index($0,p)==1 {print $2}' \
+              | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+              | sort -u
+          )
+          if [ ${#DATES[@]} -le 2 ]; then
+            echo "Nothing to prune (dates found: ${DATES[*]:-none})"
+            exit 0
+          fi
+          KEEP1="${DATES[-1]}"
+          KEEP2="${DATES[-2]}"
+          echo "Keeping: $KEEP2, $KEEP1"
+          EMPTYDIR="$(mktemp -d)"
+          for d in "${DATES[@]}"; do
+            if [ "$d" != "$KEEP1" ] && [ "$d" != "$KEEP2" ]; then
+              echo "Pruning tiles/${CHART_TYPE}/${d}/"
+              b2 sync --delete "$EMPTYDIR/" "b2://${B2_BUCKET}/tiles/${CHART_TYPE}/${d}/"
+            fi
+          done
+          rmdir "$EMPTYDIR" || true
+
+      # ----- Purge Cloudflare so clients see new tiles -----
       - name: Purge Cloudflare cache
         env:
           CF_ZONE_ID:   ${{ secrets.CLOUDFLARE_ZONE_ID }}
@@ -157,28 +230,21 @@ jobs:
             -d '{"purge_everything":true}' \
             -w "\nHTTP Status: %{http_code}\n"
 
-      # -------- your extra steps --------
-
+      # ----- Simple report artifact per chart type -----
       - name: Create processing report
         if: always()
         env:
-          CHART_DATE:  ${{ steps.chart_meta.outputs.chart_date }}
-          CHART_DIR:   ${{ steps.chart_meta.outputs.chart_dir }}
-          CHART_TYPE:  ${{ github.event.inputs.chart_type }}
+          TARGET_DATE: ${{ steps.pickdate.outputs.target_date }}
+          CHART_TYPE:  ${{ matrix.chart_type.id }}
         run: |
           set -euo pipefail
-          REPORT="$GITHUB_WORKSPACE/report.md"
+          REPORT="$GITHUB_WORKSPACE/report_${CHART_TYPE}.md"
           {
-            echo "# Chart Processing Report"
+            echo "# Chart Processing Report (${CHART_TYPE})"
             echo
-            echo "**Date:** $(date -u)  "
-            echo "**Chart Date:** ${CHART_DATE}  "
+            echo "**UTC Now:** $(date -u)  "
+            echo "**FAA Chart Date:** ${TARGET_DATE}  "
             echo "**Chart Type:** ${CHART_TYPE}  "
-            echo
-            echo "## Processing Summary"
-            echo '```'
-            find "${CHART_DIR}" -maxdepth 1 -type f -name "*.db" -exec ls -lh {} \;
-            echo '```'
             echo
             echo "## Disk Usage"
             echo '```'
@@ -191,8 +257,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: processing-report-${{ steps.chart_meta.outputs.chart_date }}
-          path: report.md
+          name: processing-report-${{ matrix.chart_type.id }}-${{ steps.pickdate.outputs.target_date }}
+          path: report_${{ matrix.chart_type.id }}.md
           retention-days: 30
 
       - name: Cleanup
@@ -210,9 +276,8 @@ jobs:
       - name: Send notification
         run: |
           if [ "${{ needs.process-charts.result }}" = "success" ]; then
-            echo "✅ Charts processed and uploaded successfully"
-            echo "Access at: https://charts.leonis85.com/"
+            echo "✅ All chart types processed and uploaded (or skipped if current)."
           else
-            echo "❌ Chart processing failed"
-            echo "Check logs at: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "❌ One or more chart types failed."
+            echo "See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           fi
