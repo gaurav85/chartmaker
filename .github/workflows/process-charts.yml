@@ -49,10 +49,9 @@ jobs:
           sudo mv b2-linux /usr/local/bin/b2
           b2 version
       
-      - name: Configure B2
+      - name: Configure B2 credentials
         run: |
-          b2 account authorize ${{ secrets.B2_KEY_ID }} ${{ secrets.B2_APP_KEY }}
-          echo "B2 authorization successful"
+          b2 account authorize ${{ secrets.B2_KEY_ID }} ${{ secrets.B2_APPLICATION_KEY }}
       
       - name: Determine chart command
         id: chart_command
