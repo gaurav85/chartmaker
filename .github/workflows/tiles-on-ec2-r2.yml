@@ -207,13 +207,21 @@ jobs:
           done
 
       - name: (Optional) Purge Cloudflare zone cache
-        if: ${{ always() && secrets.CLOUDFLARE_ZONE_ID != '' }}
+        if: ${{ always() }}   # always enter the step; we'll guard inside
+        env:
+          CF_ZONE:  ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          CF_EMAIL: ${{ secrets.CLOUDFLARE_API_EMAIL }}
+          CF_KEY:   ${{ secrets.CLOUDFLARE_API_KEY }}
         run: |
           set -euxo pipefail
-          curl -sS "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+          if [ -z "${CF_ZONE}" ]; then
+            echo "Cloudflare purge skipped: CF_ZONE not set."
+            exit 0
+          fi
+          curl -sS "https://api.cloudflare.com/client/v4/zones/${CF_ZONE}/purge_cache" \
             -H 'Content-Type: application/json' \
-            -H "X-Auth-Email: ${{ secrets.CLOUDFLARE_API_EMAIL }}" \
-            -H "X-Auth-Key: ${{ secrets.CLOUDFLARE_API_KEY }}" \
+            -H "X-Auth-Email: ${CF_EMAIL}" \
+            -H "X-Auth-Key: ${CF_KEY}" \
             -d '{"purge_everything":true}' \
             -w "\nHTTP Status: %{http_code}\n"
 
