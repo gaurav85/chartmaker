@@ -29,32 +29,53 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Start EC2 self-hosted runner (Spot, 200GB, docker preinstall)
+      - name: Start EC2 self-hosted runner (Docker preinstall)
         id: start
-        uses: machulav/ec2-github-runner@v2
+        uses: machulav/ec2-github-runner@v2.3.3
         with:
           mode: start
           github-token: ${{ secrets.GH_RUNNER_PAT }}
-          market-type: spot
-          ec2-image-id: ${{ secrets.EC2_AMI_ID }}
+          ec2-image-id: ${{ secrets.EC2_AMI_ID }}          # Ubuntu 22.04/24.04 AMI
           ec2-instance-type: c7i.2xlarge
           subnet-id: ${{ secrets.EC2_SUBNET_ID }}
           security-group-id: ${{ secrets.EC2_SECURITY_GROUP_ID }}
-          labels: ec2-tiles-${{ github.run_id }}
-          block-device-mappings: |
-            [{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3","DeleteOnTermination":true}}]
+          label: ec2-tiles-${{ github.run_id }}            # singular: 'label'
+          runner-home-dir: /home/ubuntu
+          wait-for-runner-timeout: 600
           pre-runner-script: |
             set -euxo pipefail
-            if command -v apt-get >/dev/null 2>&1; then
-              apt-get update
-              apt-get install -y docker.io jq curl unzip
-              systemctl enable --now docker
-            else
-              yum -y update || true
-              yum install -y docker jq curl unzip || true
-              systemctl enable --now docker || service docker start || true
+            # Force IPv4 so apt doesn't try IPv6 mirrors
+            echo 'Acquire::ForceIPv4 "true";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4
+
+            # Prepare packages
+            sudo apt-get update
+            sudo apt-get install -y ca-certificates curl gnupg jq unzip
+
+            # On Ubuntu 24.04, the distro 'containerd' conflicts with Docker's containerd.io.
+            # Remove distro containerd if present before installing Docker CE.
+            if dpkg -l | grep -q '^ii\s\+containerd\s'; then
+              sudo systemctl stop containerd || true
+              sudo apt-get -y remove --purge containerd || true
             fi
-            docker pull ${DEFAULT_IMAGE} || true
+
+            # Docker CE repo + install
+            sudo install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            sudo chmod a+r /etc/apt/keyrings/docker.gpg
+            . /etc/os-release
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" | sudo tee /etc/apt/sources.list.d/docker.list
+            sudo apt-get update
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            sudo systemctl enable --now docker
+
+            # AWS CLI v2 (for uploads to R2 via S3 API)
+            curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            unzip -q awscliv2.zip
+            sudo ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli || true
+            aws --version || true
+
+            # Pre-pull your chart image
+            docker pull n129bz/chartmaker:latest || true
 
   build-all:
     name: Build + upload tiles (all types, in parallel)
