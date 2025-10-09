@@ -53,14 +53,11 @@ jobs:
 
   build-all:
     name: Build + upload tiles (all types, in parallel)
-    needs: start-runner
-    strategy:
-      matrix:
-        runner_label: [ec2-tiles-${{ github.run_id }}]
-    runs-on: [self-hosted, ${{ matrix.runner_label }}]
+    needs: start-runner   # <— ASCII hyphen
+    runs-on: ${{ fromJSON(format('["self-hosted","{0}"]', needs.start-runner.outputs.label)) }}
     env:
       AWS_DEFAULT_REGION: "auto"
-      AWS_ENDPOINT_URL_S3: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      AWS_ENDPOINT_URL_S3: "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_PUBLIC_HOST: ${{ secrets.R2_PUBLIC_HOST }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
