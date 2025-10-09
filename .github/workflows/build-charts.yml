@@ -1,4 +1,4 @@
-name: Build FAA tiles and publish to B2 (pan-able, no region)
+name: Build FAA tiles and publish to Cloudflare R2 (dev)
 
 on:
   workflow_dispatch:
@@ -10,8 +10,6 @@ defaults:
 jobs:
   process-charts:
     runs-on: ubuntu-latest
-
-    # Run everything inside the chartmaker image
     container:
       image: n129bz/chartmaker:latest
 
@@ -19,15 +17,20 @@ jobs:
       fail-fast: false
       matrix:
         chart_type:
-          # VFR sectionals = all sectional areas
           - { id: vfr,      args: "area-all" }
-          # IFR enroute low/high are indices 5 & 6 in the "full" list
           - { id: ifr_low,  args: "full-single=5" }
           - { id: ifr_high, args: "full-single=6" }
 
     env:
-      WEBSERVERMODE: "false"                            # prevent webserver
-      B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}     # target B2 bucket
+      WEBSERVERMODE: "false"
+      # R2 is S3-compatible; configure AWS CLI to talk to R2
+      AWS_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:    auto
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      AWS_ENDPOINT_URL_S3:  https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      R2_BUCKET:            ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_HOST:       ${{ secrets.R2_PUBLIC_HOST }}
 
     steps:
       - name: Checkout repo
@@ -62,31 +65,25 @@ jobs:
           jq '.settings.webservermode=false
               | .settings.opendefaultbrowser=false
               | .settings.cleanprocessfolders=false' settings.json > s && mv s settings.json
-          jq '.settings | {webservermode, opendefaultbrowser, cleanprocessfolders, zoomrange, tileimagequality}' settings.json
+          jq '.settings | {webservermode, opendefaultbrowser, cleanprocessfolders}' settings.json
 
       - name: Copy chartdates.json into container
         run: |
           set -euxo pipefail
           cp "$GITHUB_WORKSPACE/chartdates.json" /chartmaker/chartdates.json
 
-      # ---------- B2 CLI setup (once per job) ----------
-      - name: Install B2 CLI (v4.x)
+      # ----- AWS CLI v2 (talks to R2 using env endpoint) -----
+      - name: Install AWS CLI
         run: |
           set -euxo pipefail
-          if ! command -v pip3 >/dev/null 2>&1; then
-            apt-get update && apt-get install -y python3-pip
-          fi
-          pip3 install --upgrade "b2[full]" --break-system-packages
+          apt-get update
+          apt-get install -y unzip curl
+          curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+          unzip -q awscliv2.zip
+          ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli || true
+          aws --version
 
-      - name: Configure B2 credentials
-        env:
-          B2_KEY_ID:  ${{ secrets.B2_KEY_ID }}
-          B2_APP_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-        run: |
-          set -euxo pipefail
-          b2 account authorize "${B2_KEY_ID}" "${B2_APP_KEY}"
-
-      # ---------- Pick FAA date from MM-DD-YYYY list ----------
+      # ----- Pick FAA date from chartdates.json (MM-DD-YYYY) -----
       - name: Select FAA chart date from chartdates.json
         id: pickdate
         working-directory: /chartmaker
@@ -131,67 +128,45 @@ jobs:
           echo "target_date=$TARGET" >> "$GITHUB_OUTPUT"
           echo "Selected FAA chart date: $TARGET (today=$(date -u +%Y-%m-%d))"
 
-      # ---------- Check B2, skip if date already present ----------
-      - name: Check B2 for existing tiles (skip if present)
-        id: check_b2
+      # ----- Skip if tiles exist in R2 -----
+      - name: Check R2 for existing tiles (skip if present)
+        id: check_r2
         env:
-          B2_BUCKET:  ${{ secrets.B2_BUCKET_NAME }}
-          CHART_TYPE: ${{ matrix.chart_type.id }}
+          CHART_TYPE:  ${{ matrix.chart_type.id }}
           TARGET_DATE: ${{ steps.pickdate.outputs.target_date }}
         run: |
           set -euo pipefail
           PREFIX="tiles/${CHART_TYPE}/${TARGET_DATE}/"
-          echo "Checking bucket: ${B2_BUCKET}"
-          echo "Folder/prefix:   ${PREFIX}"
-
-          OUT="$(b2 ls --json "${B2_BUCKET}" "${PREFIX}" 2>/dev/null || true)"
-          echo "Raw b2 ls output (first 200 chars):"
-          echo "${OUT}" | head -c 200; echo
-
-          if echo "${OUT}" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
-            COUNT=$(echo "${OUT}" | jq 'length')
-            echo "Found ${COUNT} objects under ${PREFIX}"
+          echo "Checking r2://${R2_BUCKET}/${PREFIX}"
+          COUNT="$(aws s3api list-objects-v2 --bucket "${R2_BUCKET}" --prefix "${PREFIX}" --max-keys 1 --query 'KeyCount' --output text || echo 0)"
+          if [ "${COUNT}" != "0" ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tiles already present — skipping build/upload."
           else
-            echo "No objects found under ${PREFIX}"
             echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No tiles yet — will build and upload."
           fi
 
-      # ---------- Patch IFR High shapefile pattern (l->h) ----------
+      # ----- IFR High: alias any h* to l* clipshapes -----
       - name: Fix IFR High clipshape filenames (create l* aliases for all h*)
         if: matrix.chart_type.id == 'ifr_high'
         working-directory: /chartmaker/clipshapes/enroute_high
         run: |
           set -euxo pipefail
-          echo "Before aliasing:"
-          ls -1 || true
-
           shopt -s nullglob
-          made_any=0
           for shp in enr_h*.shp; do
-            base="${shp%.shp}"         # e.g., enr_h36
-            num="${base#enr_h}"        # e.g., 36
-            dst="enr_l${num}"          # e.g., enr_l36
+            base="${shp%.shp}"; num="${base#enr_h}"; dst="enr_l${num}"
             for ext in shp shx dbf prj; do
               if [ -f "${base}.${ext}" ] && [ ! -e "${dst}.${ext}" ]; then
                 cp -f "${base}.${ext}" "${dst}.${ext}"
-                made_any=1
               fi
             done
           done
-
-          echo "After aliasing:"
           ls -1 || true
 
-          if [ "$made_any" -eq 0 ]; then
-            echo "No 'enr_h*.shp' files found to alias; directory contents:" >&2
-            ls -la >&2 || true
-            # don't exit hard—let the build try; but warn loudly
-          fi
-
-      # ---------- Build if needed ----------
+      # ----- Build if needed -----
       - name: Build charts for ${{ matrix.chart_type.id }}
-        if: steps.check_b2.outputs.exists != 'true'
+        if: steps.check_r2.outputs.exists != 'true'
         working-directory: /chartmaker
         env:
           WEBSERVERMODE: "false"
@@ -199,85 +174,68 @@ jobs:
           set -euxo pipefail
           node make "${{ matrix.chart_type.args }}"
 
-      # ---------- Collect tile roots from workarea ----------
+      # ----- Find tile roots -----
       - name: Locate tile roots
-        if: steps.check_b2.outputs.exists != 'true'
+        if: steps.check_r2.outputs.exists != 'true'
         id: tiles
         run: |
           set -euo pipefail
           ROOT="/chartmaker/workarea"
           test -d "$ROOT" || { echo "No workarea found"; exit 1; }
-
-          # a tile root has children named 5,6,7... (zoom directories)
           mapfile -t TILE_ROOTS < <(find "$ROOT" -type d -maxdepth 3 -regex '.*/[0-9]+' -printf '%h\n' | sort -u)
           if [ ${#TILE_ROOTS[@]} -eq 0 ]; then
             echo "No tile folders detected in $ROOT" >&2; exit 1
           fi
           printf "%s\n" "${TILE_ROOTS[@]}" > /tmp/tile_roots.txt
           echo "tile_roots_file=/tmp/tile_roots.txt" >> "$GITHUB_OUTPUT"
-          echo "Found ${#TILE_ROOTS[@]} tile roots (first 10):"
           head -10 /tmp/tile_roots.txt || true
 
-      # ---------- Upload to B2 with valid v4 flags ----------
-      - name: Upload tiles to B2 (no region in path)
-        if: steps.check_b2.outputs.exists != 'true'
+      # ----- Upload to R2 (S3 API) -----
+      - name: Upload tiles to R2
+        if: steps.check_r2.outputs.exists != 'true'
         env:
           TILE_ROOTS_FILE: ${{ steps.tiles.outputs.tile_roots_file }}
-          B2_BUCKET:       ${{ secrets.B2_BUCKET_NAME }}
           CHART_TYPE:      ${{ matrix.chart_type.id }}
           TARGET_DATE:     ${{ steps.pickdate.outputs.target_date }}
         run: |
           set -euxo pipefail
-          DEST="b2://${B2_BUCKET}/tiles/${CHART_TYPE}/${TARGET_DATE}/"
-          echo "Destination: $DEST"
-
-          # Show CLI version for future debugging
-          b2 version || true
-          echo "b2 sync help (first lines):"
-          b2 sync -h | head -n 20 || true
-
+          DEST="s3://${R2_BUCKET}/tiles/${CHART_TYPE}/${TARGET_DATE}/"
+          echo "Destination: $DEST (via ${AWS_ENDPOINT_URL_S3})"
           while IFS= read -r ROOT; do
             echo "Syncing $ROOT -> $DEST"
-            # Portable flags: --no-progress and --threads are widely available
-            b2 sync \
-              --no-progress \
-              --threads 16 \
-              "$ROOT/" "$DEST"
+            aws s3 sync "$ROOT/" "$DEST" --only-show-errors
           done < "$TILE_ROOTS_FILE"
 
           echo "${TARGET_DATE}" > "latest_${CHART_TYPE}.txt"
-          b2 file upload --no-progress "${B2_BUCKET}" "latest_${CHART_TYPE}.txt" "latest_${CHART_TYPE}.txt"
+          aws s3 cp "latest_${CHART_TYPE}.txt" "s3://${R2_BUCKET}/latest_${CHART_TYPE}.txt" --only-show-errors --content-type text/plain
 
-      # ---------- Retain only newest two date folders per type ----------
-      - name: Retain only last two dates in B2
+      # ----- Keep only newest two dates per type -----
+      - name: Retain only last two dates in R2
         env:
-          B2_BUCKET:  ${{ secrets.B2_BUCKET_NAME }}
           CHART_TYPE: ${{ matrix.chart_type.id }}
         run: |
-          set -euxo pipefail
-          PREFIX="tiles/${CHART_TYPE}/"
-          mapfile -t DATES < <(
-            b2 ls "b2://${B2_BUCKET}/${PREFIX}" --json \
-              | jq -r '.[].fileName' \
-              | awk -v p="$PREFIX" -F'/' 'index($0,p)==1 {print $2}' \
-              | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
-              | sort -u
+          set -euo pipefail
+          mapfile -t PREFS < <(
+            aws s3api list-objects-v2 \
+              --bucket "${R2_BUCKET}" \
+              --prefix "tiles/${CHART_TYPE}/" \
+              --delimiter '/' \
+              --query 'CommonPrefixes[].Prefix' \
+              --output text | tr '\t' '\n' | sed -E 's#^tiles/'"${CHART_TYPE}"'/([^/]+)/$#\1#' | sort
           )
-          if [ ${#DATES[@]} -le 2 ]; then
-            echo "Nothing to prune (dates found: ${DATES[*]:-none})"; exit 0
+          if [ ${#PREFS[@]} -le 2 ]; then
+            echo "Nothing to prune (dates: ${PREFS[*]:-none})"; exit 0
           fi
-          KEEP1="${DATES[-1]}"; KEEP2="${DATES[-2]}"
+          KEEP1="${PREFS[-1]}"; KEEP2="${PREFS[-2]}"
           echo "Keeping: $KEEP2, $KEEP1"
-          EMPTYDIR="$(mktemp -d)"
-          for d in "${DATES[@]}"; do
+          for d in "${PREFS[@]}"; do
             if [ "$d" != "$KEEP1" ] && [ "$d" != "$KEEP2" ]; then
               echo "Pruning tiles/${CHART_TYPE}/${d}/"
-              b2 sync --delete "$EMPTYDIR/" "b2://${B2_BUCKET}/tiles/${CHART_TYPE}/${d}/"
+              aws s3 rm "s3://${R2_BUCKET}/tiles/${CHART_TYPE}/${d}/" --recursive --only-show-errors
             fi
           done
-          rmdir "$EMPTYDIR" || true
 
-      # ---------- Purge Cloudflare ----------
+      # ----- Purge Cloudflare (zone cache) -----
       - name: Purge Cloudflare cache
         env:
           CF_ZONE_ID:   ${{ secrets.CLOUDFLARE_ZONE_ID }}
@@ -292,7 +250,7 @@ jobs:
             -d '{"purge_everything":true}' \
             -w "\nHTTP Status: %{http_code}\n"
 
-      # ---------- Report & cleanup ----------
+      # ----- Report & cleanup -----
       - name: Create processing report
         if: always()
         env:
@@ -313,7 +271,6 @@ jobs:
             df -h
             echo '```'
           } > "$REPORT"
-          echo "Wrote $REPORT"
 
       - name: Upload report as artifact
         if: always()
@@ -339,6 +296,7 @@ jobs:
         run: |
           if [ "${{ needs.process-charts.result }}" = "success" ]; then
             echo "✅ All chart types processed and uploaded (or skipped if current)."
+            echo "Origin: https://${{ secrets.R2_PUBLIC_HOST }}/tiles/<type>/<date>/{z}/{x}/{y}.webp"
           else
             echo "❌ One or more chart types failed."
             echo "See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
