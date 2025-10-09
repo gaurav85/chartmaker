@@ -1,0 +1,245 @@
+name: Build FAA tiles on ephemeral EC2 and publish to Cloudflare R2
+
+on:
+  workflow_dispatch:
+  # schedule:
+    # - cron: "0 7 * * *" # daily 07:00 UTC; job self-skips unless within LOOKAHEAD_DAYS of next FAA date
+
+env:
+  LOOKAHEAD_DAYS: "5"        # run a few days before a chart date
+  DEFAULT_IMAGE: "n129bz/chartmaker:latest"
+  AWS_S3_FORCE_PATH_STYLE: "true"
+
+jobs:
+  start-runner:
+    name: Start EC2 runner
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.start.outputs.label }}
+      ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
+    steps:
+      - name: Assume AWS role (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Start EC2 self-hosted runner (Spot, 200GB, docker preinstall)
+        id: start
+        uses: machulav/ec2-github-runner@v3
+        with:
+          mode: start
+          github-token: ${{ secrets.GH_RUNNER_PAT }}
+          market-type: spot
+          ec2-image-id: ${{ secrets.EC2_AMI_ID }}
+          ec2-instance-type: c7i.2xlarge
+          subnet-id: ${{ secrets.EC2_SUBNET_ID }}
+          security-group-id: ${{ secrets.EC2_SECURITY_GROUP_ID }}
+          labels: ec2-tiles-${{ github.run_id }}
+          block-device-mappings: |
+            [{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3","DeleteOnTermination":true}}]
+          pre-runner-script: |
+            set -euxo pipefail
+            if command -v apt-get >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y docker.io jq curl unzip
+              systemctl enable --now docker
+            else
+              yum -y update || true
+              yum install -y docker jq curl unzip || true
+              systemctl enable --now docker || service docker start || true
+            fi
+            docker pull ${DEFAULT_IMAGE} || true
+
+  build-all:
+    name: Build + upload tiles (all types, in parallel)
+    needs: start-runner
+    runs-on: [self-hosted, ${{ needs.start-runner.outputs.label }}]
+    env:
+      AWS_DEFAULT_REGION: "auto"
+      AWS_ENDPOINT_URL_S3: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_HOST: ${{ secrets.R2_PUBLIC_HOST }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install AWS CLI (on the EC2 runner host)
+        run: |
+          set -euxo pipefail
+          if ! command -v aws >/dev/null 2>&1; then
+            curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            unzip -q awscliv2.zip
+            ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli || true
+          fi
+          aws --version
+
+      - name: Put chartdates.json in shared dir
+        run: |
+          set -euxo pipefail
+          mkdir -p /mnt/common
+          cp chartdates.json /mnt/common/chartdates.json
+
+      - name: Decide target FAA date (lookahead-aware) and short-circuit if nothing to do
+        id: dates
+        run: |
+          set -euo pipefail
+          LOOKAHEAD_DAYS="${LOOKAHEAD_DAYS:-5}"
+
+          pick_date() {
+            mapfile -t RAW < <(jq -r '.ChartDates[]' /mnt/common/chartdates.json)
+            DATES=()
+            for d in "${RAW[@]}"; do
+              if [[ "$d" =~ ^([0-1][0-9])-([0-3][0-9])-(20[0-9]{2})$ ]]; then
+                iso="${BASH_REMATCH[3]}-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+                date -u -d "$iso" +%s >/dev/null 2>&1 && DATES+=("$iso")
+              fi
+            done
+            IFS=$'\n' read -r -d '' -a SORTED < <(printf "%s\n" "${DATES[@]}" | sort && printf '\0')
+            TODAY_EPOCH="$(date -u +%s)"; PREV=""; NEXT=""
+            for iso in "${SORTED[@]}"; do
+              epoch=$(date -u -d "$iso" +%s)
+              if [ "$epoch" -le "$TODAY_EPOCH" ]; then PREV="$iso"; else if [ -z "$NEXT" ]; then NEXT="$iso"; fi; fi
+            done
+            if [ -n "${NEXT}" ]; then
+              next_epoch=$(date -u -d "$NEXT" +%s)
+              delta_days=$(( (next_epoch - TODAY_EPOCH) / 86400 ))
+              if [ "$delta_days" -le "$LOOKAHEAD_DAYS" ] && [ "$delta_days" -ge 0 ]; then
+                echo "$NEXT"; return
+              fi
+            fi
+            echo "${PREV:-${NEXT}}"
+          }
+
+          TARGET_DATE="$(pick_date)"
+          echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
+
+          # Skip if all three already exist
+          all_exist=true
+          for T in vfr ifr_low ifr_high; do
+            PFX="tiles/${T}/${TARGET_DATE}/"
+            COUNT="$(AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" aws s3api list-objects-v2 --bucket "${R2_BUCKET}" --prefix "${PFX}" --max-keys 1 --query 'KeyCount' --output text || echo 0)"
+            if [ "$COUNT" = "0" ]; then all_exist=false; fi
+          done
+          echo "all_exist=$all_exist" >> "$GITHUB_OUTPUT"
+          $all_exist && echo "Everything already uploaded for ${TARGET_DATE} — exiting early." && exit 0 || true
+
+      - name: Build all three in parallel on this host
+        if: steps.dates.outputs.all_exist != 'true'
+        run: |
+          set -euxo pipefail
+          run_chart () {
+            local TYPE="$1" ARGS="$2"
+            local WD="/mnt/builds/${TYPE}"
+            mkdir -p "${WD}/workarea" "${WD}/chartcache" "${WD}/staging"
+            local prefix=""
+            if [ "$TYPE" = "ifr_high" ]; then
+              prefix='set -euxo pipefail; cd /chartmaker/clipshapes/enroute_high; shopt -s nullglob; for s in enr_h*.shp; do b=${s%.shp}; n=${b#enr_h}; d=enr_l${n}; for ext in shp shx dbf prj; do [ -f "${b}.${ext}" ] && [ ! -e "${d}.${ext}" ] && cp -f "${b}.${ext}" "${d}.${ext}" || true; done; done; cd /chartmaker; '
+            fi
+            docker run --rm \
+              -e WEBSERVERMODE=false \
+              -v "${WD}/workarea:/chartmaker/workarea" \
+              -v "${WD}/chartcache:/chartmaker/chartcache" \
+              -v "/mnt/common/chartdates.json:/chartmaker/chartdates.json:ro" \
+              ${DEFAULT_IMAGE} \
+              bash -lc "${prefix} \
+                jq '.settings.webservermode=false | .settings.opendefaultbrowser=false | .settings.cleanprocessfolders=false' settings.json > s && mv s settings.json; \
+                node make '${ARGS}'"
+          }
+
+          # Start missing ones
+          for TYPE in vfr ifr_low ifr_high; do
+            PFX="tiles/${TYPE}/${{ steps.dates.outputs.target_date }}/"
+            COUNT="$(AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" aws s3api list-objects-v2 --bucket "${R2_BUCKET}" --prefix "${PFX}" --max-keys 1 --query 'KeyCount' --output text || echo 0)"
+            if [ "$COUNT" != "0" ]; then
+              echo "Skip $TYPE: already exists in R2."
+              continue
+            fi
+            case "$TYPE" in
+              vfr) ARGS="area-all" ;;
+              ifr_low) ARGS="full-single=5" ;;
+              ifr_high) ARGS="full-single=6" ;;
+            esac
+            run_chart "$TYPE" "$ARGS" & echo "PID_${TYPE}=$!" >> /tmp/pids.env
+          done
+
+          # Wait for all
+          if [ -f /tmp/pids.env ]; then
+            set +x; . /tmp/pids.env; set -x
+            for p in ${PID_vfr:-} ${PID_ifr_low:-} ${PID_ifr_high:-}; do [ -n "$p" ] && wait "$p"; done
+          fi
+
+      - name: Upload to R2, write latest_*.txt
+        if: steps.dates.outputs.all_exist != 'true'
+        env:
+          TARGET_DATE: ${{ steps.dates.outputs.target_date }}
+        run: |
+          set -euxo pipefail
+          for TYPE in vfr ifr_low ifr_high; do
+            WD="/mnt/builds/${TYPE}"
+            [ -d "${WD}/workarea" ] || continue
+            mapfile -t ROOTS < <(find "${WD}/workarea" -type d -maxdepth 3 -regex '.*/[0-9]+' -printf '%h\n' | sort -u || true)
+            [ "${#ROOTS[@]}" -gt 0 ] || { echo "No tiles for ${TYPE}"; continue; }
+            DEST="s3://${R2_BUCKET}/tiles/${TYPE}/${TARGET_DATE}/"
+            echo "Uploading ${TYPE} -> ${DEST}"
+            for R in "${ROOTS[@]}"; do
+              AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" aws s3 sync "$R/" "$DEST" --only-show-errors
+            done
+            echo "${TARGET_DATE}" > "/mnt/common/latest_${TYPE}.txt"
+            AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" aws s3 cp "/mnt/common/latest_${TYPE}.txt" "s3://${R2_BUCKET}/latest_${TYPE}.txt" --only-show-errors --content-type text/plain
+          done
+
+      - name: Retain only the newest two dates per type
+        run: |
+          set -euxo pipefail
+          for TYPE in vfr ifr_low ifr_high; do
+            mapfile -t PREFS < <(AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" aws s3api list-objects-v2 --bucket "${R2_BUCKET}" --prefix "tiles/${TYPE}/" --delimiter '/' --query 'CommonPrefixes[].Prefix' --output text | tr '\t' '\n' | sed -E 's#^tiles/'"${TYPE}"'/([^/]+)/$#\1#' | sort)
+            if [ ${#PREFS[@]} -gt 2 ]; then
+              KEEP1="${PREFS[-1]}"; KEEP2="${PREFS[-2]}"
+              for d in "${PREFS[@]}"; do
+                if [ "$d" != "$KEEP1" ] && [ "$d" != "$KEEP2" ]; then
+                  AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" aws s3 rm "s3://${R2_BUCKET}/tiles/${TYPE}/${d}/" --recursive --only-show-errors
+                fi
+              done
+            fi
+          done
+
+      - name: (Optional) Purge Cloudflare zone cache
+        if: ${{ always() && secrets.CLOUDFLARE_ZONE_ID != '' }}
+        run: |
+          set -euxo pipefail
+          curl -sS "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+            -H 'Content-Type: application/json' \
+            -H "X-Auth-Email: ${{ secrets.CLOUDFLARE_API_EMAIL }}" \
+            -H "X-Auth-Key: ${{ secrets.CLOUDFLARE_API_KEY }}" \
+            -d '{"purge_everything":true}' \
+            -w "\nHTTP Status: %{http_code}\n"
+
+      - name: Cleanup disks
+        if: always()
+        run: |
+          set +e
+          rm -rf /mnt/builds/*/workarea/* /mnt/builds/*/chartcache/* 2>/dev/null || true
+          df -h
+
+  stop-runner:
+    name: Stop EC2 runner
+    if: always()
+    needs: [start-runner, build-all]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assume AWS role (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Stop EC2 self-hosted runner
+        uses: machulav/ec2-github-runner@v3
+        with:
+          mode: stop
+          github-token: ${{ secrets.GH_RUNNER_PAT }}
+          label: ${{ needs.start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-runner.outputs.ec2-instance-id }}
