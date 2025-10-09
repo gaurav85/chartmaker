@@ -5,6 +5,11 @@ on:
   # schedule:
     # - cron: "0 7 * * *" # daily 07:00 UTC; job self-skips unless within LOOKAHEAD_DAYS of next FAA date
 
+permissions:
+  id-token: write     # <-- REQUIRED for AWS OIDC
+  contents: read      # checkout etc.
+  actions: write      # (optional) helpful for runner actions that register/unregister
+
 env:
   LOOKAHEAD_DAYS: "5"        # run a few days before a chart date
   DEFAULT_IMAGE: "n129bz/chartmaker:latest"
