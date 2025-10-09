@@ -207,7 +207,7 @@ jobs:
           done
 
       - name: (Optional) Purge Cloudflare zone cache
-        if: always() && {{ secrets.CLOUDFLARE_ZONE_ID }} != ''
+        if: ${{ always() && secrets.CLOUDFLARE_ZONE_ID != '' }}
         run: |
           set -euxo pipefail
           curl -sS "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
