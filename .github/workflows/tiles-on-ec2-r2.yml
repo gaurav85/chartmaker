@@ -120,7 +120,24 @@ jobs:
           set -euxo pipefail
           mkdir -p /mnt/common
           cp chartdates.json /mnt/common/chartdates.json
+      
+      - name: Install jq + Node on runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
 
+          if ! command -v node >/dev/null 2>&1; then
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+          fi
+
+          jq --version
+          node -v
+      
       - name: Decide target FAA date (lookahead-aware) and short-circuit if nothing to do
         id: dates
         run: |
