@@ -183,8 +183,26 @@ jobs:
           $all_exist && echo "Everything already uploaded for ${TARGET_DATE} — exiting early." && exit 0 || true
 
       - name: Build all three in parallel on this host
-        if: steps.dates.outputs.all_exist != 'true'
+        shell: bash
+        env:
+          JQ: /usr/bin/jq
+          NODE: /usr/bin/node
         run: |
+          set -euo pipefail
+          export PATH="/usr/local/bin:/usr/bin:/bin"   # be explicit
+
+          echo "jq: $($JQ --version)"
+          echo "node: $($NODE -v)"
+
+          # … your parallel docker runs for VFR/IFR-L/IFR-H …
+
+          # IMPORTANT: the following must run on the HOST, not inside a container:
+          FAA_DATE_JSON="$($JQ -r '.ChartDates|last' chartdates.json)"
+          echo "Using FAA date: ${FAA_DATE_JSON}"
+
+          # any Node snippet:
+          $NODE -e 'console.log("node is available on host")'
+          
           set -euxo pipefail
           run_chart () {
             local TYPE="$1" ARGS="$2"
