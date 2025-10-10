@@ -3,7 +3,7 @@ name: Build FAA tiles on ephemeral EC2 and publish to Cloudflare R2
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 7 * * *" # daily 07:00 UTC
+    - cron: "0 7 * * 1" # daily 07:00 UTC
 
 permissions:
   id-token: write
@@ -188,13 +188,9 @@ jobs:
             local WD="/mnt/builds/${TYPE}"
             mkdir -p "${WD}"/{workarea,chartcache,staging,logs}
 
-            # unique, deterministic container name per run & type
             local CNAME="tiles-${TYPE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-
-            # If a stale container exists, remove it
             docker rm -f "${CNAME}" >/dev/null 2>&1 || true
 
-            # Run detached and name the container; write logs to file too
             docker run -d --name "${CNAME}" \
               --user root \
               -e WEBSERVERMODE=false \
@@ -209,7 +205,6 @@ jobs:
 
             echo "${CNAME}"
           }
-
 
           PIDS=()
 
@@ -263,18 +258,20 @@ jobs:
           fi
 
           # Wait for each container to finish and check exit code
-          for cname in "${NAMES[@]:-}"; do
-            echo "Waiting for container ${cname} …"
-            # docker wait returns the container's exit code on stdout
-            code=$(docker wait "${cname}" || echo 1)
-            echo "Container ${cname} exit code: ${code}"
-            if [ "${code}" -ne 0 ]; then
-              echo "::error::Build container ${cname} failed. Last logs:"
-              docker logs --tail 200 "${cname}" || true
-              # also tee per-type log if you like
-              exit 1
-            fi
-          done
+          if [ "${#NAMES[@]}" -eq 0 ]; then
+            echo "Nothing to build — all tile sets already present in R2 for ${TARGET}."
+          else
+            for cname in "${NAMES[@]}"; do
+              echo "Waiting for container ${cname} …"
+              code=$(docker wait "${cname}" || echo 1)
+              echo "Container ${cname} exit code: ${code}"
+              if [ "${code}" -ne 0 ]; then
+                echo "::error::Build container ${cname} failed. Last logs:"
+                docker logs --tail 200 "${cname}" || true
+                exit 1
+              fi
+            done
+          fi
 
           for T in vfr ifr_low ifr_high; do
             WD="/mnt/builds/${T}"
@@ -398,13 +395,13 @@ jobs:
           ec2-instance-id: ${{ needs.start-runner.outputs.ec2-instance-id }}
 
   notify:
-    needs: build-all
+    needs: [stop-runner]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Send notification
         run: |
-          if [ "${{ needs.build-all.result }}" == "success" ]; then
+          if [ "${{ needs.stop-runner.result }}" == "success" ]; then
             echo "✅ Charts processed and uploaded successfully"
             echo "Access at: https://charts.leonis85.com/"
           else
