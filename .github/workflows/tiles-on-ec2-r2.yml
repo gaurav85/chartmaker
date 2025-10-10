@@ -396,3 +396,18 @@ jobs:
           github-token: ${{ secrets.GH_RUNNER_PAT }}
           label: ${{ needs.start-runner.outputs.label }}
           ec2-instance-id: ${{ needs.start-runner.outputs.ec2-instance-id }}
+
+  notify:
+    needs: build-all
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send notification
+        run: |
+          if [ "${{ needs.build-all.result }}" == "success" ]; then
+            echo "✅ Charts processed and uploaded successfully"
+            echo "Access at: https://charts.leonis85.com/"
+          else
+            echo "❌ Chart processing failed"
+            echo "Check logs at: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
