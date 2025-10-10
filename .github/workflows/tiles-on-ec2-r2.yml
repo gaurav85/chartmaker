@@ -188,7 +188,14 @@ jobs:
             local WD="/mnt/builds/${TYPE}"
             mkdir -p "${WD}"/{workarea,chartcache,staging,logs}
 
-            docker run --rm \
+            # unique, deterministic container name per run & type
+            local CNAME="tiles-${TYPE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+            # If a stale container exists, remove it
+            docker rm -f "${CNAME}" >/dev/null 2>&1 || true
+
+            # Run detached and name the container; write logs to file too
+            docker run -d --name "${CNAME}" \
               --user root \
               -e WEBSERVERMODE=false \
               -e ARGS="${ARGS}" \
@@ -198,10 +205,11 @@ jobs:
               -v /mnt/common/chartdates.json:/chartmaker/chartdates.json:ro \
               -v /mnt/common/build_inside.sh:/entry.sh:ro \
               "${DEFAULT_IMAGE}" \
-              bash /entry.sh \
-              >"${WD}/logs/build.log" 2>&1 &
-            echo $!
+              bash /entry.sh >/dev/null
+
+            echo "${CNAME}"
           }
+
 
           PIDS=()
 
@@ -230,14 +238,40 @@ jobs:
             PIDS+=( "$(run_chart ifr_high 'enroute-high')" )
           fi
 
-          for p in "${PIDS[@]:-}"; do
-            echo "Waiting for PID ${p} …"
-            if ! wait "${p}"; then
-              echo "::error::A build failed (pid ${p}). Dumping logs:"
-              for T in vfr ifr_low ifr_high; do
-                LOG="/mnt/builds/${T}/logs/build.log"
-                [ -s "${LOG}" ] && { echo "---- ${T} ----"; tail -n 200 "${LOG}"; }
-              done
+          # Start where needed
+          NAMES=()
+
+          if s3_prefix_exists "${VFR_PREFIX}"; then
+            echo "Skip vfr: already exists in R2."
+          else
+            echo "Start vfr build…"
+            NAMES+=( "$(run_chart vfr 'area-all')" )
+          fi
+
+          if s3_prefix_exists "${IFRL_PREFIX}"; then
+            echo "Skip ifr_low: already exists in R2."
+          else
+            echo "Start ifr_low build…"
+            NAMES+=( "$(run_chart ifr_low 'enroute-low')" )
+          fi
+
+          if s3_prefix_exists "${IFRH_PREFIX}"; then
+            echo "Skip ifr_high: already exists in R2."
+          else
+            echo "Start ifr_high build…"
+            NAMES+=( "$(run_chart ifr_high 'enroute-high')" )
+          fi
+
+          # Wait for each container to finish and check exit code
+          for cname in "${NAMES[@]:-}"; do
+            echo "Waiting for container ${cname} …"
+            # docker wait returns the container's exit code on stdout
+            code=$(docker wait "${cname}" || echo 1)
+            echo "Container ${cname} exit code: ${code}"
+            if [ "${code}" -ne 0 ]; then
+              echo "::error::Build container ${cname} failed. Last logs:"
+              docker logs --tail 200 "${cname}" || true
+              # also tee per-type log if you like
               exit 1
             fi
           done
