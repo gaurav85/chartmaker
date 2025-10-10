@@ -2,18 +2,13 @@ name: Build FAA tiles on ephemeral EC2 and publish to Cloudflare R2
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "0 7 * * *" # daily 07:00 UTC
+  schedule:
+    - cron: "0 7 * * *" # daily 07:00 UTC
 
 permissions:
-  id-token: write   # Required for AWS OIDC
+  id-token: write
   contents: read
-  actions: write    # Runner action registers/unregisters a self-hosted runner
-
-env:
-  LOOKAHEAD_DAYS: "5"                     # build if next FAA date is within N days
-  DEFAULT_IMAGE: "n129bz/chartmaker:latest"
-  AWS_S3_FORCE_PATH_STYLE: "true"
+  actions: write
 
 jobs:
   start-runner:
@@ -35,12 +30,12 @@ jobs:
         with:
           mode: start
           github-token: ${{ secrets.GH_RUNNER_PAT }}
-          ec2-image-id: ${{ secrets.EC2_AMI_ID }}           # your pre-baked AMI with Docker, AWS CLI, runner wrappers
+          ec2-image-id: ${{ secrets.EC2_AMI_ID }}
           ec2-instance-type: c7i.2xlarge
           subnet-id: ${{ secrets.EC2_SUBNET_ID }}
           security-group-id: ${{ secrets.EC2_SECURITY_GROUP_ID }}
           label: ec2-tiles-${{ github.run_id }}
-          runner-home-dir: /home/ubuntu                     # AMI has /home/ubuntu/config.sh & run.sh wrappers
+          runner-home-dir: /home/ubuntu
           wait-for-runner-timeout: 600
 
   build-all:
@@ -48,17 +43,19 @@ jobs:
     needs: start-runner
     runs-on: ${{ fromJSON(format('["self-hosted","{0}"]', needs.start-runner.outputs.label)) }}
     env:
-      # R2 (S3-compatible) endpoint + creds
-      AWS_DEFAULT_REGION: "auto"
-      AWS_ENDPOINT_URL_S3: "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+      # R2 endpoint + creds
+      AWS_DEFAULT_REGION: auto
+      AWS_ENDPOINT_URL_S3: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_PUBLIC_HOST: ${{ secrets.R2_PUBLIC_HOST }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      DEFAULT_IMAGE: "n129bz/chartmaker:latest"
-      LOOKAHEAD_DAYS: ${{ env.LOOKAHEAD_DAYS }}
+
+      # Build image + lookahead (set directly to avoid expression in env)
+      DEFAULT_IMAGE: n129bz/chartmaker:latest
+      LOOKAHEAD_DAYS: "5"
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install AWS CLI + jq on runner
@@ -66,7 +63,7 @@ jobs:
         run: |
           set -euxo pipefail
           if ! command -v aws >/dev/null 2>&1; then
-            curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
             unzip -q awscliv2.zip
             sudo ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli || true
           fi
@@ -77,7 +74,7 @@ jobs:
           aws --version
           jq --version
 
-      - name: Stage shared files
+      - name: Stage chartdates.json
         shell: bash
         run: |
           set -euxo pipefail
@@ -89,7 +86,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          LOOKAHEAD_DAYS="${LOOKAHEAD_DAYS:-5}"
+          LOOKAHEAD="${LOOKAHEAD_DAYS:-5}"
+
           mapfile -t RAW < <(jq -r '.ChartDates[]' /mnt/common/chartdates.json)
           DATES=()
           for d in "${RAW[@]}"; do
@@ -99,28 +97,28 @@ jobs:
             fi
           done
           IFS=$'\n' read -r -d '' -a SORTED < <(printf "%s\n" "${DATES[@]}" | sort && printf '\0')
-          TODAY_EPOCH="$(date -u +%s)"; PREV=""; NEXT=""
+
+          TODAY=$(date -u +%s); PREV=""; NEXT=""
           for iso in "${SORTED[@]}"; do
-            epoch=$(date -u -d "$iso" +%s)
-            if [ "$epoch" -le "$TODAY_EPOCH" ]; then PREV="$iso"; else if [ -z "$NEXT" ]; then NEXT="$iso"; fi; fi
+            e=$(date -u -d "$iso" +%s)
+            if [ "$e" -le "$TODAY" ]; then PREV="$iso"; else if [ -z "$NEXT" ]; then NEXT="$iso"; fi; fi
           done
-          if [ -n "${NEXT}" ]; then
-            next_epoch=$(date -u -d "$NEXT" +%s)
-            delta_days=$(( (next_epoch - TODAY_EPOCH) / 86400 ))
-            if [ "$delta_days" -le "$LOOKAHEAD_DAYS" ] && [ "$delta_days" -ge 0 ]; then
+
+          if [ -n "$NEXT" ]; then
+            ne=$(date -u -d "$NEXT" +%s)
+            dd=$(( (ne - TODAY) / 86400 ))
+            if [ "$dd" -le "$LOOKAHEAD" ] && [ "$dd" -ge 0 ]; then
               TARGET_DATE="$NEXT"
             else
               TARGET_DATE="${PREV:-$NEXT}"
             fi
           else
-            TARGET_DATE="${PREV}"
+            TARGET_DATE="$PREV"
           fi
-          if [ -z "${TARGET_DATE}" ]; then
-            echo "::error::Could not determine TARGET_DATE from chartdates.json"
-            exit 1
-          fi
-          echo "TARGET_DATE=${TARGET_DATE}"
-          echo "target_date=${TARGET_DATE}" >> "$GITHUB_OUTPUT"
+
+          [ -n "$TARGET_DATE" ] || { echo "::error::Could not determine TARGET_DATE"; exit 1; }
+          echo "TARGET_DATE=$TARGET_DATE"
+          echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
 
       - name: Build all three in parallel
         id: build
@@ -136,7 +134,6 @@ jobs:
 
           echo "TARGET_DATE=${TARGET}"
 
-          # helper: does a prefix exist in R2?
           s3_prefix_exists() {
             local prefix="$1"
             AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" \
@@ -146,13 +143,11 @@ jobs:
               --query 'KeyCount' --output text 2>/dev/null | grep -qE '^[1-9][0-9]*$'
           }
 
-          # container entry script
           cat >/mnt/common/build_inside.sh <<'INSC'
           #!/usr/bin/env bash
           set -euo pipefail
           echo "[inside] ARGS=${ARGS} CHART_DATE=${CHART_DATE:-unset}"
 
-          # jq
           if ! command -v jq >/dev/null 2>&1; then
             if command -v apt-get >/dev/null 2>&1; then
               apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y jq curl gnupg
@@ -163,7 +158,6 @@ jobs:
             fi
           fi
 
-          # node
           if ! command -v node >/dev/null 2>&1; then
             if command -v apt-get >/dev/null 2>&1; then
               curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
@@ -176,14 +170,11 @@ jobs:
           fi
 
           cd /chartmaker
-
-          # keep intermediates, no webserver
           jq '.settings.webservermode=false
               | .settings.opendefaultbrowser=false
               | .settings.cleanprocessfolders=false' settings.json > s && mv s settings.json
 
           export CHART_DATE="${CHART_DATE:-}"
-
           echo "[inside] invoking: node make ${ARGS}"
           node make "${ARGS}"
 
@@ -251,7 +242,6 @@ jobs:
             fi
           done
 
-          # Verify we actually produced roots
           for T in vfr ifr_low ifr_high; do
             WD="/mnt/builds/${T}"
             if [ -d "${WD}/workarea" ]; then
@@ -260,6 +250,8 @@ jobs:
               if [ "${#ROOTS[@]}" -eq 0 ]; then
                 echo "::warning::No tile roots detected for ${T}; see ${WD}/logs/build.log"
               fi
+            else
+              echo "::notice::${T} has no workarea (likely skipped)."
             fi
           done
 
@@ -276,7 +268,6 @@ jobs:
           for TYPE in vfr ifr_low ifr_high; do
             WD="/mnt/builds/${TYPE}"
             [ -d "${WD}/workarea" ] || { echo "Skip ${TYPE}: no workarea"; continue; }
-
             mapfile -t ROOTS < <(find "${WD}/workarea" -type d -maxdepth 3 -regex '.*/[0-9]+' -printf '%h\n' | sort -u)
             if [ "${#ROOTS[@]}" -eq 0 ]; then
               echo "Skip ${TYPE}: no tile roots."
