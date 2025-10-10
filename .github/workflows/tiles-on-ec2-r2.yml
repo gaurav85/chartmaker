@@ -58,21 +58,20 @@ jobs:
           wait-for-runner-timeout: 600
           pre-runner-script: |
             set -euxo pipefail
-            # Force IPv4 so apt doesn't try IPv6 mirrors
+            # Force apt to IPv4 (avoids AAAA mirror issues)
             echo 'Acquire::ForceIPv4 "true";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4
 
-            # Prepare packages
+            # Base tools
             sudo apt-get update
             sudo apt-get install -y ca-certificates curl gnupg jq unzip
 
-            # On Ubuntu 24.04, the distro 'containerd' conflicts with Docker's containerd.io.
-            # Remove distro containerd if present before installing Docker CE.
+            # On Ubuntu 24.04, remove distro containerd before Docker CE (avoids conflict)
             if dpkg -l | grep -q '^ii\s\+containerd\s'; then
               sudo systemctl stop containerd || true
               sudo apt-get -y remove --purge containerd || true
             fi
 
-            # Docker CE repo + install
+            # Docker CE
             sudo install -m 0755 -d /etc/apt/keyrings
             curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
             sudo chmod a+r /etc/apt/keyrings/docker.gpg
@@ -82,13 +81,13 @@ jobs:
             sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
             sudo systemctl enable --now docker
 
-            # AWS CLI v2 (for uploads to R2 via S3 API)
+            # AWS CLI v2
             curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
             unzip -q awscliv2.zip
             sudo ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli || true
             aws --version || true
 
-            # Pre-pull your chart image
+            # Pre-pull your chart image (optional)
             docker pull n129bz/chartmaker:latest || true
 
   build-all:
