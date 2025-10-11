@@ -1,0 +1,112 @@
+name: Delete tiles from Cloudflare R2
+
+on:
+  workflow_dispatch:
+    inputs:
+      chart_date:
+        description: "Chart date (YYYY-MM-DD)"
+        required: true
+        type: string
+      chart_type:
+        description: "Chart type"
+        required: true
+        type: choice
+        options: [vfr, ifr_low, ifr_high]
+
+permissions:
+  contents: read
+
+jobs:
+  delete-r2-prefix:
+    name: Delete tiles for ${{ inputs.chart_type }} @ ${{ inputs.chart_date }}
+    runs-on: ubuntu-latest
+    env:
+      # R2 S3-compatible endpoint and bucket
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      AWS_DEFAULT_REGION: "auto"
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL_S3: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      DATE: ${{ inputs.chart_date }}
+      TYPE: ${{ inputs.chart_type }}
+
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Basic YYYY-MM-DD validation
+          if ! [[ "${DATE}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::chart_date must be YYYY-MM-DD (got '${DATE}')"
+            exit 1
+          fi
+          case "${TYPE}" in
+            vfr|ifr_low|ifr_high) ;;
+            *) echo "::error::chart_type must be one of vfr|ifr_low|ifr_high"; exit 1 ;;
+          esac
+          echo "Inputs OK: type=${TYPE}, date=${DATE}"
+
+      - name: Show target prefix and a short preview
+        id: preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="tiles/${TYPE}/${DATE}/"
+          echo "Deleting prefix: s3://${R2_BUCKET}/${PREFIX}"
+          echo "Preview (up to 20 keys):"
+          aws s3api list-objects-v2 \
+            --bucket "${R2_BUCKET}" \
+            --prefix "${PREFIX}" \
+            --max-keys 20 \
+            --query 'Contents[].Key' \
+            --output text
+          COUNT=$(aws s3api list-objects-v2 \
+            --bucket "${R2_BUCKET}" \
+            --prefix "${PREFIX}" \
+            --query 'KeyCount' \
+            --output text)
+          echo "TOTAL keys under prefix: ${COUNT}"
+          echo "prefix=${PREFIX}" >> "$GITHUB_OUTPUT"
+          if [ "${COUNT}" = "0" ]; then
+            echo "::warning::No objects found under ${PREFIX}. Nothing to delete."
+            exit 0
+          fi
+
+      - name: Delete recursively
+        if: steps.preview.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Deleting recursively: s3://${R2_BUCKET}/${{ steps.preview.outputs.prefix }}"
+          aws s3 rm \
+            "s3://${R2_BUCKET}/${{ steps.preview.outputs.prefix }}" \
+            --recursive --only-show-errors
+          echo "Deletion complete."
+
+      - name: Verify deletion
+        if: steps.preview.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          COUNT_AFTER=$(aws s3api list-objects-v2 \
+            --bucket "${R2_BUCKET}" \
+            --prefix "${{ steps.preview.outputs.prefix }}" \
+            --query 'KeyCount' \
+            --output text)
+          if [ "${COUNT_AFTER}" != "0" ]; then
+            echo "::error::Some objects remain (${COUNT_AFTER}) under ${{ steps.preview.outputs.prefix }}"
+            exit 1
+          fi
+          echo "Confirmed: prefix empty."
+
+    #   (Optional) If you also want to purge Cloudflare cache for these paths,
+    #   add your CF secrets and uncomment this block:
+      - name: Purge Cloudflare cache (optional)
+        if: steps.preview.outcome == 'success' && secrets.CLOUDFLARE_ZONE_ID != ''
+        run: |
+          curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+            -H 'Content-Type: application/json' \
+            -H "X-Auth-Email: ${{ secrets.CLOUDFLARE_API_EMAIL }}" \
+            -H "X-Auth-Key: ${{ secrets.CLOUDFLARE_API_KEY }}" \
+            --data '{"purge_everything":true}'  
